@@ -12,99 +12,77 @@ on:
       - release-4.*
 
 jobs:
-  commit-check:
-    name: Commit Check
+  lints:
+    name: Lints
     runs-on: ubuntu-latest
     steps:
-      - name: commit check
-        uses: gsactions/commit-message-checker@v1
+      - name: Commit Check
+        uses: gsactions/commit-message-checker@v2
         with:
           pattern: |
-            ^(.*):\s*(.*)\n.*$
+            ^[^:!]+: .+\n\n.*$
           error: 'Commit must begin with <scope>: <subject>'
           flags: 'gm'
           excludeTitle: true
           excludeDescription: true
           checkAllCommitMessages: true
           accessToken: ${{ secrets.GITHUB_TOKEN }}
-
-  api-reference-check:
-    name: API Reference Check
-    runs-on: ubuntu-latest
-    steps:
       - name: Checkout
-        uses: actions/checkout@v2
-      - name: gen api reference
+        id: checkout
+        if: ${{ !cancelled() }}
+        uses: actions/checkout@v4
+      - name: Check Filenames
+        if: ${{ !cancelled() && steps.checkout.conclusion == 'success' }}
+        run: | # Check for all the characters Windows hates.
+          git ls-files -- ':/:*[<>:"|?*]*' | while read -r file; do
+            printf '::error file=%s,title=Bad Filename::Disallowed character in file name\n' "$file"
+          done
+          exit $(git ls-files -- ':/:*[<>:"|?*]*' | wc -l)
+      - name: Check API Reference
+        if: ${{ !cancelled() && steps.checkout.conclusion == 'success' }}
         run: |
           npx widdershins --search false --language_tabs 'python:Python' 'go:Golang' 'javascript:Javascript' --summary ./openapi.yaml -o ./Documentation/reference/api.md
-      - name: diff
-        run: |
           git diff --exit-code
-
-  tidy:
-    name: Tidy
-    runs-on: ubuntu-latest
-    container: quay.io/projectquay/golang:1.16
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v2
+      - name: Check Container Versions
+        if: ${{ !cancelled() && steps.checkout.conclusion == 'success' }}
+        run: |
+          # awk ...
+          version=$(sed -n '/^go /{s/go \(1\.[0-9]\+\)\.[0-9]\+/\1/;p;q}' go.mod)
+          {
+            find . -name Dockerfile |
+              xargs awk -v "want=$version" '/^ARG GO_VERSION/{split($2,ver,/=/);if(ver[2]!=want) printf "%s\t%d\n", FILENAME, FNR}'
+            awk -v "want=$version" '/&go-image/{split($3,ref,/:/);if(ref[2]!=want) printf "%s\t%d\n", FILENAME, FNR}' docker-compose.yaml
+          } |
+            awk -v "want=$version" '{printf "::error file=%s,line=%d,title=Go Version Skew::Go version does not match `go.mod`: want %s\n", $1, $2, want}'
+      - name: Setup Go
+        id: 'setupgo'
+        if: ${{ !cancelled() && steps.checkout.conclusion == 'success' }}
+        uses: actions/setup-go@v5
+        with:
+          cache: false
+          go-version-file: ./go.mod
       - name: Go Tidy
-        run: go mod tidy
-      - name: Git Diff
-        run: git diff --exit-code
+        if: ${{ !cancelled() && steps.checkout.conclusion == 'success' && steps.setupgo.conclusion == 'success' }}
+        run: |
+          # go mod tidy
+          trap 'echo "::error file=go.mod,title=Tidy Check::Commit would leave go.mod untidy"' ERR
+          go mod tidy
+          git diff --exit-code
 
   documentation:
     name: Documentation
+    needs: ['lints']
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout
-        uses: actions/checkout@v2
-      - name: Setup
-        uses: peaceiris/actions-mdbook@v1
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/documentation
         with:
-          mdbook-version: 'latest'
-      - run: mdbook build
+          publish: false
 
   tests:
     name: Tests
-    runs-on: ubuntu-latest
-    container: quay.io/projectquay/golang:${{ matrix.go }}
-    env:
-      POSTGRES_CONNECTION_STRING: "host=clair-db port=5432 user=clair dbname=clair sslmode=disable"
-      RABBITMQ_CONNECTION_STRING: "amqp://guest:guest@clair-rabbitmq:5672/"
-      STOMP_CONNECTION_STRING: "clair-activemq:61613"
-    services:
-      clair-db:
-        image: postgres:11.5
-        env:
-          POSTGRES_USER: "clair"
-          POSTGRES_DB: "clair"
-          POSTGRES_INITDB_ARGS: "--no-sync"
-        options: >-
-          --health-cmd pg_isready
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 5
-      clair-rabbitmq:
-        image: rabbitmq:3.8.5
-        env:
-          RABBITMQ_VM_MEMORY_HIGH_WATERMARK: "85%"
-      clair-activemq:
-        image: webcenter/activemq:5.14.3
-
-    strategy:
-      matrix:
-        go: ['1.16', '1.17']
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v2
-      - name: Go Dependencies
-        run: go mod vendor
-      - name: Tests
-        run: go test -tags integration ./...
-      - name: Create Artifact on Failure
-        uses: actions/upload-artifact@v2
-        if: failure()
-        with:
-          name: workspace-${{matrix.go}}
-          path: ${{ github.workspace }}
+    needs: ['lints']
+    uses: ./.github/workflows/tests.yml
+    with:
+      package_expr: ./...
+      qemu: false

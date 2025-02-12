@@ -1,100 +1,91 @@
 # Testing Clair
 
-We provide dev tooling in order to quickly get a fully configured Clair and Quay environment stood up locally. This environment can be used to test and develop Clair.
+We provide dev tooling in order to quickly get a fully configured Clair and Quay environment stood up locally.
+This environment can be used to test and develop Clair's Quay integration.
 
 ## Requirements
 
 ### Make
 
-Make is used to stand up the the local dev environment. 
+Make is used to stand up the local dev environment.
 Make is readily available in just about every package manager you can think of.
 It's very likely your workstation already has make on it.
 
-### Docker and Docker Compose
+### Podman/Docker and Docker Compose
 
-Currently our local dev tooling is supported by docker and docker-compose. We are making strides to provide a podman native local dev environment but we are not quite there yet.
+Currently our local dev tooling is supported by docker and docker-compose.
+Podman should work fine since v3.0.
 
-Docker version 19.03.11 and docker-compose version 1.25.4 are confirmed working. Our assumption is most recent versions will not have an issue running the local dev tooling.
+Docker version 19.03.11 and docker-compose version 1.28.6 are confirmed working.
+Our assumption is most recent versions will not have an issue running the local dev tooling.
 
-See [Install Docker](https://docs.docker.com/get-docker/)
+See [Get Started with Podman](https://podman.io/get-started).
 
 ### Go Toolchain
 
-Go v1.13 or higher is required.
+Go 1.20 or higher is required.
 
-See [Install Golang](https://golang.org/doc/install)
+See [Install Golang](https://golang.org/doc/install).
 
 ## Starting a cluster
 
 ```
 git clone git@github.com:quay/clair.git
 cd clair
-make local-dev-up-with-quay
+docker-compose up -d
+# or: make local-dev
+# or: make local-dev-debug
+# or: make local-dev-quay
 ```
 
 After the local development environment successfully starts, the following infrastructure is available to you:
 
-```
-localhost:8080 --- Quay (single node, local storage)
+- `localhost:8080`
 
-localhost:6060 --- Traefik which hosts all ClairV4 endpoints.
-                   ClairV4 services are only accessible via this load balancer.
+  Dashboards and debugging services -- See the traefik configs in `local-dev/traefik` for where the various services are served.
 
-localhost:5432 --- ClairV4's Postgres DB
-                   Login:
-                      username: clair
-                      database: clair
+- `localhost:6060`
 
-localhost:5433 --- Quay's Postgres DB
-                   Login:
-                     username: quay
-                     database: quay
+  Clair services.
 
-localhost:8081 --- Postgres GUI (pgadmin4)
-                   Login:
-                     username: clair@clair.com
-                     password: clair
+- Quay (if started)
 
-localhost:8082 --- OpenAPI Swagger Editor.
-                   You can view ClairV4's public API here.
+  Quay will be started in a single node, local storage configuration.
+  A random port will be forwarded from localhost, see `podman port` for the mapping.
 
-localhost:8087 --- RabbitMQ management GUI
-                   Login:
-                     username: guest
-                     password: guest
+- PostgreSQL
 
-localhost:8161 --- ActiveMQ management GUI
-                   Login:
-                     username: admin
-                     password: admin
+  PostgreSQL will have a random port forwarded from localhost to the database server.
+  See `local-dev/clair/init.sql` for credentials and permissions and `podman port` for the mapping.
 
-localhost:7000 --- Traefik Web UI.
-                   Good for troubleshooting http issues.
+### Debugging
 
-localhost:9090 --- Prometheus
+With the `local-dev-debug` make target the operator has access to some more useful tools:
 
-localhost:3000 --- Grafana
-                   Login:
-                     username: admin
-                     password: admin
-```
+| Tool       | Description                     | URL                                                         | Credentials           |
+| ---------- | ------------------------------- | ----------------------------------------------------------- | --------------------- |
+| pgAdmin    | Postgres administration         | [localhost:8080/pgadmin](http://localhost:8080/pgadmin)     | clair@clair.com:clair |
+| jaeger     | Distributed tracing             | [localhost:8080/jaeger](http://localhost:8080/jaeger)       | -                     |
+| prometheus | Metrics collection and querying | [localhost:8080/prom](http://localhost:8080/prom)           | -                     |
+| pyroscope  | Continuous profiling            | [localhost:8080/pyroscope](http://localhost:8080/pyroscope) | -                     |
+| grafana    | Metrics dashboards              | [localhost:8080/grafana](http://localhost:8080/grafana)     | admin:admin           |
 
 ## Pushing to the Local Quay
 
-As mentioned above, Quay is present at `localhost:8080`. You may navigate to this address and create a account. Creating an account named `admin` will ensure you are a super user. An email is required, but is not validated.
+As mentioned above, Quay is forwarded to a random port on the host.
+You can connect to the server on that port and create a account.
+Creating an account named `admin` will ensure you are a super user.
+An email is required, but is not validated.
+You'll also need to create a namespace.
 
-Once inside, you will create an organization named "clairv4-org". Currently Quay has to explicitly enable Clair v4 security scanning, which is done via an organization allowlist. "clairv4-org" is preconfigured in our local dev configuration.
+To push to Quay, you'll need to exec into the skopeo container:
 
-The easiest way to push to Quay is using podman:
-
+```shell
+docker-compose exec -it skopeo /usr/bin/skopeo copy --dest-creds '<user>:<pass>' --dest-tls-verify=false <src> docker://clair-quay:8080/<namespace>/<repo>:<tag>
 ```
-podman pull ubuntu:latest
-podman login --tls-verify=false localhost:8080 # use account created in above steps
-podman tag ubuntu:latest localhost:8080/clairv4-org/testing:latest
-podman push --tls-verify=false localhost:8080/clairv4-org/testing:latest
-```
+Note that skopeo expects its image arguments in [`containers-transports(5)`] format.
 
-Using docker to push is possible, however you will need to add "localhost:8080" as an insecure repository. See [Insecure Repository](https://docs.docker.com/registry/insecure/)
+[`containers-transports(5)`]: https://github.com/containers/image/blob/main/docs/containers-transports.5.md
 
 ## Viewing Results
 
@@ -102,15 +93,15 @@ By default, Quay displays security scanner results on the Tags page of the given
 
 ## Making changes to configuration
 
-You may want to play with either Clair or Quay's configuration. 
-If so, the configuration files can be found inside the repository at
-local-dev/quay/config.yaml` and `local-dev/clair/config.yaml`.
-Any changes to the configs will require a restart of the relevant service. Take a look at the `Makefile` for the various restart targets.
+You may want to play with either Clair or Quay's configuration.
+If so, the configuration files can be found inside the repository at `local-dev/quay/config.yaml` and `local-dev/clair/config.yaml`.
+Any changes to the configs will require a restart of the relevant service.
+The quay-specific clair config is autogenerated, see the `Makefile`.
 
 ## Tearing it down
 
 ```
-make local-dev-down
+docker-compose down
 ```
 
 will rip the entire environment down.
@@ -118,8 +109,14 @@ will rip the entire environment down.
 
 ## Troubleshooting
 
-The most common issue encountered when standing up the dev environment is port conflicts. Make sure that you do not have any other processes listening on any of the ports outlined above.
+The most common issue encountered when standing up the dev environment is port conflicts.
+Make sure that you do not have any other processes listening on any of the ports outlined above.
 
-The second issue you may face is your Docker resource settings maybe too constrained to support the local dev stack. This is typically seen on Docker4Mac since a VM is used with a specific set of resources configured. See [Docker For Mac Manual](https://docs.docker.com/docker-for-mac/) for instructions on how to change these resources.
+The second issue you may face is your Docker resource settings being too constrained to support the local dev stack.
+This is typically seen on Docker4Mac since a VM is used with a specific set of resources configured.
+See [Docker For Mac Manual](https://docs.docker.com/docker-for-mac/) for instructions on how to change these resources.
 
-Lastly, you can view traefik's ui at `localhost:7000`. If traefik is reporting no routers or services its likely SELinux has blocked its access to `/var/run/docker.socket`. Place SELinux in permissive mode and restart the local development environment.
+If `docker-compose` reports errors like `Unsupported config option for services.activemq: 'profiles'`, the `docker-compose` version is too old and you'll need to upgrade.
+Consult the relevant documentation for your environment for instructions.
+
+Lastly, you can view traefik's ui at [`localhost:8080/dashboard/`](http://localhost:8080/dashboard/).

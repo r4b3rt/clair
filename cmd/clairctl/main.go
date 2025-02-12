@@ -5,11 +5,14 @@ import (
 	"os"
 	"time"
 
+	"github.com/go-jose/go-jose/v3/jwt"
+	"github.com/quay/clair/config"
 	_ "github.com/quay/claircore/updater/defaults"
 	"github.com/quay/zlog"
 	"github.com/rs/zerolog"
 	"github.com/urfave/cli/v2"
-	"gopkg.in/square/go-jose.v2/jwt"
+
+	"github.com/quay/clair/v4/cmd"
 )
 
 var (
@@ -32,7 +35,7 @@ func main() {
 
 	app := &cli.App{
 		Name:                 "clairctl",
-		Version:              "0.2.0",
+		Version:              cmd.Version,
 		Usage:                "interact with a clair API",
 		Description:          "A command-line tool for clair v4.",
 		EnableBashCompletion: true,
@@ -52,6 +55,9 @@ func main() {
 			ReportCmd,
 			ExportCmd,
 			ImportCmd,
+			DeleteCmd,
+			CheckConfigCmd,
+			AdminCmd,
 		},
 		Flags: []cli.Flag{
 			&cli.BoolFlag{
@@ -89,4 +95,12 @@ func main() {
 	}
 
 	app.RunContext(ctx, os.Args)
+}
+
+func loadConfig(n string) (*config.Config, error) {
+	var cfg config.Config
+	if err := cmd.LoadConfig(&cfg, n, false); err != nil {
+		return nil, err
+	}
+	return &cfg, nil
 }

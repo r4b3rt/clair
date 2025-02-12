@@ -6,8 +6,9 @@ import (
 	"encoding/json"
 	"fmt"
 
-	gostomp "github.com/go-stomp/stomp"
 	"github.com/google/uuid"
+	"github.com/quay/clair/config"
+	"github.com/quay/zlog"
 
 	clairerror "github.com/quay/clair/v4/clair-error"
 	"github.com/quay/clair/v4/notifier"
@@ -16,29 +17,21 @@ import (
 // Deliverer is a STOMP deliverer which publishes a notifier.Callback to the
 // the broker.
 type DirectDeliverer struct {
-	conf Config
-	n    []notifier.Notification
-	fo   *failOver
+	Deliverer
+	n []notifier.Notification
 }
 
-func NewDirectDeliverer(conf Config) (*DirectDeliverer, error) {
-	var c Config
-	var err error
-	if c, err = conf.Validate(); err != nil {
+func NewDirectDeliverer(conf *config.STOMP) (*DirectDeliverer, error) {
+	var d DirectDeliverer
+	if err := d.load(conf); err != nil {
 		return nil, err
 	}
-	fo := &failOver{
-		Config: c,
-	}
-	return &DirectDeliverer{
-		conf: c,
-		n:    []notifier.Notification{},
-		fo:   fo,
-	}, nil
+	d.n = make([]notifier.Notification, 0, 1024)
+	return &d, nil
 }
 
 func (d *DirectDeliverer) Name() string {
-	return fmt.Sprintf("stomp-direct-%s", d.conf.Destination)
+	return fmt.Sprintf("stomp-direct-%s", d.destination)
 }
 
 // Notifications will copy the provided notifications into a buffer for STOMP
@@ -50,7 +43,7 @@ func (d *DirectDeliverer) Notifications(ctx context.Context, n []notifier.Notifi
 		copy(d.n, n)
 		return nil
 	}
-	tmp := make([]notifier.Notification, len(n), len(n))
+	tmp := make([]notifier.Notification, len(n))
 	copy(tmp, n)
 	d.n = tmp
 	return nil
@@ -59,48 +52,59 @@ func (d *DirectDeliverer) Notifications(ctx context.Context, n []notifier.Notifi
 func (d *DirectDeliverer) Deliver(ctx context.Context, nID uuid.UUID) error {
 	conn, err := d.fo.Connection(ctx)
 	if err != nil {
-		return &clairerror.ErrDeliveryFailed{err}
+		return errDeliever(err)
 	}
 	defer conn.Disconnect()
 
 	tx, err := conn.BeginWithError()
 	if err != nil {
-		return &clairerror.ErrDeliveryFailed{err}
+		return errDeliever(err)
 	}
+	var success bool
+	defer func() {
+		if success {
+			return
+		}
+		if err := tx.AbortWithReceipt(); err != nil {
+			zlog.Warn(ctx).Err(err).Msg("transaction aborted")
+		}
+	}()
 
 	// block loop publishing smaller blocks of max(rollup) length via reslicing.
-	var rollup int = d.conf.Rollup
+	rollup := d.rollup
 	if rollup == 0 {
 		rollup++
 	}
 
-	var buf bytes.Buffer
-	enc := json.NewEncoder(&buf)
 	var currentBlock []notifier.Notification
 	for bs, be := 0, rollup; bs < len(d.n); bs, be = be, be+rollup {
-		buf.Reset()
-		// if block-end exceeds array bounds, slice block underflow.
-		// next block-start will cause loop to exit.
+		// If block-end exceeds array bounds, slice block underflow.
+		// Next block-start will cause loop to exit.
 		if be > len(d.n) {
 			be = len(d.n)
 		}
 
 		currentBlock = d.n[bs:be]
-		err := enc.Encode(&currentBlock)
-		if err != nil {
-			tx.Abort()
-			return &clairerror.ErrDeliveryFailed{err}
+		// Can't reuse a buffer because without receipts, the client returns
+		// after queuing the send.
+		// Can't use receipts because RabbitMQ treats receipt as a thing that
+		// happens at the end of a transaction (not unreasonable, I suppose).
+		var buf bytes.Buffer
+		if err := json.NewEncoder(&buf).Encode(&currentBlock); err != nil {
+			return errDeliever(err)
 		}
-		err = tx.Send(d.conf.Destination, "application/json", buf.Bytes(), gostomp.SendOpt.Receipt)
-		if err != nil {
-			tx.Abort()
-			return &clairerror.ErrDeliveryFailed{err}
+		if err := tx.Send(d.destination, "application/json", buf.Bytes(), nil); err != nil {
+			return errDeliever(err)
 		}
 	}
 
-	err = tx.Commit()
-	if err != nil {
-		return &clairerror.ErrDeliveryFailed{err}
+	if err := tx.CommitWithReceipt(); err != nil {
+		return errDeliever(err)
 	}
+	success = true
 	return nil
+}
+
+func errDeliever(e error) error {
+	return &clairerror.ErrDeliveryFailed{E: e}
 }

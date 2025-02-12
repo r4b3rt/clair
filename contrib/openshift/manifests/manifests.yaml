@@ -17,6 +17,7 @@ objects:
         service: indexer
         app: clair
     spec:
+      podManagementPolicy: Parallel
       replicas: ${{INDEXER_DEPLOYMENT_REPLICAS}}
       selector:
         matchLabels:
@@ -38,13 +39,11 @@ objects:
             service: indexer
             app: clair
         spec:
+          serviceAccountName: ${SERVICE_ACCOUNT}
           volumes:
             - name: clair-config
               secret:
-                secretName: ${{CLAIR_SECRET}}
-                items:
-                  - key: config
-                    path: clair.conf
+                secretName: config
           containers:
             - name: clair-indexer
               resources:
@@ -57,7 +56,7 @@ objects:
               command: [clair]
               env:
                 - name: CLAIR_CONF
-                  value: '/etc/clair/clair.conf'
+                  value: '/etc/clair/config.yaml'
                 - name: CLAIR_MODE
                   value: indexer
               image: ${CLAIR_IMAGE}:${IMAGE_TAG}
@@ -72,17 +71,19 @@ objects:
                   port: ${{HEALTH_PORT}}
               readinessProbe:
                 httpGet:
-                  path: ${{HEALTH_PATH}}
+                  path: ${{READY_PATH}}
                   port: ${{HEALTH_PORT}}
               startupProbe:
                 httpGet:
-                  path: ${{HEALTH_PATH}}
+                  path: ${{READY_PATH}}
                   port: ${{HEALTH_PORT}}
+                failureThreshold: 400
+                periodSeconds: 10
               volumeMounts:
                 - name: clair-config
                   mountPath: /etc/clair
                 - name: indexer-layer-storage
-                  mountPath: /tmp
+                  mountPath: /var/tmp
 
   #
   # matcher deployment
@@ -107,13 +108,11 @@ objects:
             service: matcher
             app: clair
         spec:
+          serviceAccountName: ${SERVICE_ACCOUNT}
           volumes:
             - name: clair-config
               secret:
-                secretName: ${{CLAIR_SECRET}}
-                items:
-                  - key: config
-                    path: clair.conf
+                secretName: config
           containers:
             - name: clair-matcher
               resources:
@@ -126,7 +125,7 @@ objects:
               command: [clair]
               env:
                 - name: CLAIR_CONF
-                  value: '/etc/clair/clair.conf'
+                  value: '/etc/clair/config.yaml'
                 - name: CLAIR_MODE
                   value: matcher
               image: ${CLAIR_IMAGE}:${IMAGE_TAG}
@@ -141,12 +140,14 @@ objects:
                   port: ${{HEALTH_PORT}}
               readinessProbe:
                 httpGet:
-                  path: ${{HEALTH_PATH}}
+                  path: ${{READY_PATH}}
                   port: ${{HEALTH_PORT}}
               startupProbe:
                 httpGet:
-                  path: ${{HEALTH_PATH}}
+                  path: ${{READY_PATH}}
                   port: ${{HEALTH_PORT}}
+                failureThreshold: 400
+                periodSeconds: 10
               volumeMounts:
                 - name: clair-config
                   mountPath: /etc/clair
@@ -173,13 +174,11 @@ objects:
             service: notifier
             app: clair
         spec:
+          serviceAccountName: ${SERVICE_ACCOUNT}
           volumes:
             - name: clair-config
               secret:
-                secretName: ${{CLAIR_SECRET}}
-                items:
-                  - key: config
-                    path: clair.conf
+                secretName: config
           containers:
             - name: clair-notifier
               resources:
@@ -192,7 +191,7 @@ objects:
               command: [clair]
               env:
                 - name: CLAIR_CONF
-                  value: '/etc/clair/clair.conf'
+                  value: '/etc/clair/config.yaml'
                 - name: CLAIR_MODE
                   value: notifier
               image: ${CLAIR_IMAGE}:${IMAGE_TAG}
@@ -207,12 +206,14 @@ objects:
                   port: ${{HEALTH_PORT}}
               readinessProbe:
                 httpGet:
-                  path: ${{HEALTH_PATH}}
+                  path: ${{READY_PATH}}
                   port: ${{HEALTH_PORT}}
               startupProbe:
                 httpGet:
-                  path: ${{HEALTH_PATH}}
+                  path: ${{READY_PATH}}
                   port: ${{HEALTH_PORT}}
+                failureThreshold: 400
+                periodSeconds: 10
               volumeMounts:
                 - name: clair-config
                   mountPath: /etc/clair
@@ -291,6 +292,16 @@ objects:
       selector:
         service: notifier
         app: clair
+  #
+  # service account
+  #
+  - apiVersion: v1
+    kind: ServiceAccount
+    metadata:
+      name: ${SERVICE_ACCOUNT}
+    imagePullSecrets:
+      - name: quay.io
+
 parameters:
   #
   # indexer params
@@ -352,9 +363,6 @@ parameters:
   #
   # shared params
   #
-  - name: CLAIR_SECRET
-    value: "clair"
-    displayName: the vault secret containing clair's config
   - name: CLAIR_IMAGE
     value: "quay.io/app-sre/clair"
     displayName: the image of clair v4 to deploy
@@ -370,9 +378,16 @@ parameters:
   - name: HEALTH_PATH
     value: "/healthz"
     displayName: the http path to clair's health check endpoint
+  - name: READY_PATH
+    value: "/readyz"
+    displayName: the http path to clair's ready endpoint
   - name: HEALTH_PORT
     value: "8089"
     displayName: the port to clair's health check endpoint
   - name: STORAGE_CLASS_NAME
     value: "gp2"
     displayName: the storage class to use when creating VPCs
+  - name: SERVICE_ACCOUNT
+    value: "clair"
+    displayName: clair service account
+    description: name of the service account to use for API interaction

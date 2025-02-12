@@ -13,6 +13,7 @@ import (
 	"github.com/quay/clair/v4/httptransport"
 	"github.com/quay/clair/v4/indexer"
 	"github.com/quay/clair/v4/internal/codec"
+	"github.com/quay/clair/v4/internal/httputil"
 )
 
 var _ indexer.Service = (*HTTP)(nil)
@@ -27,8 +28,11 @@ func (s *HTTP) AffectedManifests(ctx context.Context, v []claircore.Vulnerabilit
 	}{
 		v,
 	})
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, u.String(), rd)
+	req, err := httputil.NewRequestWithContext(ctx, http.MethodPost, u.String(), rd)
 	if err != nil {
+		return nil, fmt.Errorf("failed to create request: %v", err)
+	}
+	if err := s.sign(ctx, req); err != nil {
 		return nil, fmt.Errorf("failed to create request: %v", err)
 	}
 	req.Header.Set("content-type", `application/json`)
@@ -70,8 +74,11 @@ func (s *HTTP) Index(ctx context.Context, manifest *claircore.Manifest) (*clairc
 		return nil, fmt.Errorf("failed to create request: %v", err)
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, u.String(), codec.JSONReader(manifest))
+	req, err := httputil.NewRequestWithContext(ctx, http.MethodPost, u.String(), codec.JSONReader(manifest))
 	if err != nil {
+		return nil, fmt.Errorf("failed to create request: %v", err)
+	}
+	if err := s.sign(ctx, req); err != nil {
 		return nil, fmt.Errorf("failed to create request: %v", err)
 	}
 	req.Header.Set("content-type", `application/json`)
@@ -108,8 +115,11 @@ func (s *HTTP) IndexReport(ctx context.Context, manifest claircore.Digest) (*cla
 		return nil, false, fmt.Errorf("failed to create request: %v", err)
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
+	req, err := httputil.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
 	if err != nil {
+		return nil, false, fmt.Errorf("failed to create request: %v", err)
+	}
+	if err := s.sign(ctx, req); err != nil {
 		return nil, false, fmt.Errorf("failed to create request: %v", err)
 	}
 	resp, err := s.c.Do(req)
@@ -126,7 +136,8 @@ func (s *HTTP) IndexReport(ctx context.Context, manifest claircore.Digest) (*cla
 			E: &clairerror.ErrRequestFail{
 				Code:   resp.StatusCode,
 				Status: resp.Status,
-			}}
+			},
+		}
 	}
 
 	ir := &claircore.IndexReport{}
@@ -143,8 +154,11 @@ func (s *HTTP) State(ctx context.Context) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("failed to create request: %v", err)
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
+	req, err := httputil.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
 	if err != nil {
+		return "", fmt.Errorf("failed to create request: %v", err)
+	}
+	if err := s.sign(ctx, req); err != nil {
 		return "", fmt.Errorf("failed to create request: %v", err)
 	}
 	resp, err := s.c.Do(req)
@@ -157,4 +171,37 @@ func (s *HTTP) State(ctx context.Context) (string, error) {
 		return "", err
 	}
 	return buf.String(), nil
+}
+
+// DeleteManifests deletes the specified manifests.
+//
+// Passing a digest of an unknown manifest is not an error.
+func (s *HTTP) DeleteManifests(ctx context.Context, d ...claircore.Digest) ([]claircore.Digest, error) {
+	// This implementation always uses the bulk delete endpoint.
+	u, err := s.addr.Parse(httptransport.IndexAPIPath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create request: %v", err)
+	}
+	req, err := httputil.NewRequestWithContext(ctx, http.MethodDelete, u.String(), codec.JSONReader(d))
+	if err != nil {
+		return nil, fmt.Errorf("failed to create request: %v", err)
+	}
+	if err := s.sign(ctx, req); err != nil {
+		return nil, fmt.Errorf("failed to create request: %v", err)
+	}
+	resp, err := s.c.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("failed to do request: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("unexpected response status: %v", resp.Status)
+	}
+	var ret []claircore.Digest
+	dec := codec.GetDecoder(resp.Body)
+	defer codec.PutDecoder(dec)
+	if err := dec.Decode(&ret); err != nil {
+		return nil, fmt.Errorf("failed to decode response: %w", err)
+	}
+	return ret, nil
 }

@@ -16,6 +16,7 @@ import (
 	clairerror "github.com/quay/clair/v4/clair-error"
 	"github.com/quay/clair/v4/httptransport"
 	"github.com/quay/clair/v4/internal/codec"
+	"github.com/quay/clair/v4/internal/httputil"
 	"github.com/quay/clair/v4/matcher"
 )
 
@@ -26,9 +27,12 @@ func (c *HTTP) Scan(ctx context.Context, ir *claircore.IndexReport) (*claircore.
 	if err != nil {
 		return nil, err
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, u.String(), codec.JSONReader(ir))
+	req, err := httputil.NewRequestWithContext(ctx, http.MethodPost, u.String(), codec.JSONReader(ir))
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to create request: %v", err)
+	}
+	if err := c.sign(ctx, req); err != nil {
+		return nil, fmt.Errorf("failed to create request: %v", err)
 	}
 	req.Header.Set("content-type", `application/json`)
 	resp, err := c.c.Do(req)
@@ -59,7 +63,7 @@ func (c *HTTP) Scan(ctx context.Context, ir *claircore.IndexReport) (*claircore.
 
 // DeleteUpdateOperations attempts to delete the referenced update operations.
 func (c *HTTP) DeleteUpdateOperations(ctx context.Context, ref ...uuid.UUID) (int64, error) {
-	u, err := c.addr.Parse(httptransport.UpdateOperationAPIPath)
+	u, err := c.addr.Parse(httptransport.UpdateOperationDeleteAPIPath)
 	if err != nil {
 		return 0, err
 	}
@@ -84,9 +88,13 @@ func (c *HTTP) DeleteUpdateOperations(ctx context.Context, ref ...uuid.UUID) (in
 					errs[i] = err
 					return
 				}
-				req, err := http.NewRequestWithContext(ctx, http.MethodDelete, u.String(), nil)
+				req, err := httputil.NewRequestWithContext(ctx, http.MethodDelete, u.String(), nil)
 				if err != nil {
 					errs[i] = err
+					return
+				}
+				if err := c.sign(ctx, req); err != nil {
+					errs[i] = fmt.Errorf("failed to create request: %v", err)
 					return
 				}
 				res, err := c.c.Do(req)
@@ -109,7 +117,7 @@ func (c *HTTP) DeleteUpdateOperations(ctx context.Context, ref ...uuid.UUID) (in
 
 	var b strings.Builder
 	var errd bool
-	var deleted = int64(len(ref))
+	deleted := int64(len(ref))
 	for _, err := range errs {
 		if err != nil {
 			deleted--
@@ -142,9 +150,12 @@ func (c *HTTP) UpdateOperations(ctx context.Context, k driver.UpdateKind, update
 	v := url.Values{}
 	v.Add("kind", string(k))
 	u.RawQuery = v.Encode()
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
+	req, err := httputil.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
 	if err != nil {
 		return nil, err
+	}
+	if err := c.sign(ctx, req); err != nil {
+		return nil, fmt.Errorf("failed to create request: %v", err)
 	}
 	return c.updateOperations(ctx, req, c.uoCache)
 }
@@ -160,7 +171,7 @@ func (c *HTTP) LatestUpdateOperations(ctx context.Context, k driver.UpdateKind) 
 	v.Add("kind", string(k))
 	u.RawQuery = v.Encode()
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
+	req, err := httputil.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
 	if err != nil {
 		return nil, err
 	}
@@ -180,6 +191,9 @@ func (c *HTTP) LatestUpdateOperations(ctx context.Context, k driver.UpdateKind) 
 // an ouCache is passed in by the caller to cache any responses providing an etag.
 // if a subsequent response provides a StatusNotModified status, the map of UpdateOprations is served from cache.
 func (c *HTTP) updateOperations(ctx context.Context, req *http.Request, cache *uoCache) (map[string][]driver.UpdateOperation, error) {
+	if err := c.sign(ctx, req); err != nil {
+		return nil, fmt.Errorf("failed to create request: %v", err)
+	}
 	res, err := c.c.Do(req)
 	if err != nil {
 		return nil, err
@@ -216,7 +230,7 @@ func (c *HTTP) UpdateDiff(ctx context.Context, prev, cur uuid.UUID) (*driver.Upd
 	if err != nil {
 		return nil, err
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
+	req, err := httputil.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
 	if err != nil {
 		return nil, err
 	}
@@ -226,6 +240,9 @@ func (c *HTTP) UpdateDiff(ctx context.Context, prev, cur uuid.UUID) (*driver.Upd
 	}
 	v.Set("cur", cur.String())
 	req.URL.RawQuery = v.Encode()
+	if err := c.sign(ctx, req); err != nil {
+		return nil, fmt.Errorf("failed to create request: %v", err)
+	}
 
 	res, err := c.c.Do(req)
 	if err != nil {

@@ -11,8 +11,10 @@ import (
 	"golang.org/x/sync/errgroup"
 
 	"github.com/google/uuid"
+	"github.com/quay/clair/config"
 	"github.com/quay/claircore/test/integration"
-	samqp "github.com/streadway/amqp"
+	"github.com/quay/zlog"
+	amqp "github.com/rabbitmq/amqp091-go"
 )
 
 const (
@@ -23,28 +25,29 @@ const (
 // callback is successfully delivered to the amqp broker.
 func TestDeliverer(t *testing.T) {
 	integration.Skip(t)
+	ctx := zlog.Test(context.Background(), t)
 	const (
-		callback = "http://clair-notifier/notifier/api/v1/notifications"
+		callback = "http://clair-notifier/notifier/api/v1/notification"
 	)
 	var (
 		uri         = os.Getenv("RABBITMQ_CONNECTION_STRING")
 		queueAndKey = uuid.New().String()
 		// our test assumes a default exchange
-		exchange = Exchange{
-			Name:       "",
-			Type:       "direct",
-			Durable:    true,
-			AutoDelete: false,
-		}
-		conf = Config{
-			Callback:   callback,
-			Exchange:   exchange,
+		conf = config.AMQP{
+			Callback: callback,
+			Exchange: config.Exchange{
+				Name:       "",
+				Type:       "direct",
+				Durable:    true,
+				AutoDelete: false,
+			},
 			RoutingKey: queueAndKey,
 		}
 	)
 	if uri == "" {
 		uri = defaultRabbitMQURI
 	}
+	t.Logf("using uri: %q", uri)
 
 	conf.URIs = []string{
 		// give a few bogus URIs to confirm failover mechanisms are working
@@ -54,7 +57,7 @@ func TestDeliverer(t *testing.T) {
 		uri,
 	}
 
-	conn, err := samqp.Dial(uri)
+	conn, err := amqp.Dial(uri)
 	if err != nil {
 		t.Fatalf("failed to connect to broker at %v: %v", uri, err)
 	}
@@ -85,13 +88,13 @@ func TestDeliverer(t *testing.T) {
 	for i := 0; i < 4; i++ {
 		g.Go(func() error {
 			noteID := uuid.New()
-			d, err := New(conf)
+			d, err := New(&conf)
 			if err != nil {
 				return fmt.Errorf("could not create deliverer: %v", err)
 			}
 			// we simply need to check for an error. amqp
 			// will error if message cannot be delivered to broker
-			err = d.Deliver(context.TODO(), noteID)
+			err = d.Deliver(ctx, noteID)
 			if err != nil {
 				return fmt.Errorf("failed to deliver message: %v", err)
 			}
@@ -103,7 +106,7 @@ func TestDeliverer(t *testing.T) {
 	}
 
 	// create consumer
-	consumerConn, err := samqp.Dial(uri)
+	consumerConn, err := amqp.Dial(uri)
 	if err != nil {
 		t.Fatalf("failed to create consumer connection: %v", err)
 	}

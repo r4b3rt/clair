@@ -26,18 +26,6 @@ updaters:
     - rhel
 ```
 
-#### Filtering Updaters
-
-To disallow an updater from running without disabling an entire set, the filter
-option can be used. The provided string will be interpreted as a go [regexp]
-used to disallow any updater with a name that does not match. **Note:** This
-means that an empty string matches *any* string, not no strings.
-
-```yaml
-updaters:
-  filter: '^$'
-```
-
 #### Specific Updaters
 
 Configuration for specific updaters can be passed by putting a key underneath
@@ -70,17 +58,17 @@ For example:
 
 ```sh
 # On a workstation, run:
-clairctl export-updaters updates.gz
+clairctl export-updaters updates.json.gz
 ```
 
 ```sh
 # Move the resulting file to a place reachable by the cluster:
-scp updates.gz internal-webserver:/var/www/
+scp updates.json.gz internal-webserver:/var/www/
 ```
 
 ```sh
 # On a pod inside the cluster, import the file:
-clairctl import-updaters http://web.svc/updates.gz
+clairctl import-updaters http://web.svc/updates.json.gz
 ```
 
 Note that a configuration file is needed to run these commands.

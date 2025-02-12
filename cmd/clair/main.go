@@ -2,30 +2,29 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
+	"errors"
 	"flag"
 	"fmt"
 	golog "log"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
 	"time"
 
+	"github.com/quay/clair/config"
 	_ "github.com/quay/claircore/updater/defaults"
 	"github.com/quay/zlog"
-	"go.opentelemetry.io/otel/baggage"
-	"go.opentelemetry.io/otel/label"
 	"golang.org/x/sync/errgroup"
-	yaml "gopkg.in/yaml.v3"
 
-	"github.com/quay/clair/v4/config"
+	"github.com/quay/clair/v4/cmd"
 	"github.com/quay/clair/v4/health"
 	"github.com/quay/clair/v4/httptransport"
 	"github.com/quay/clair/v4/initialize"
+	"github.com/quay/clair/v4/initialize/auto"
 	"github.com/quay/clair/v4/introspection"
 )
-
-// Version is a version string, injected at build time for release builds.
-var Version string
 
 const (
 	envConfig = `CLAIR_CONF`
@@ -34,19 +33,43 @@ const (
 
 func main() {
 	// parse conf from cli
-	var (
-		confFile ConfValue
-		conf     config.Config
-		runMode  ConfMode
-	)
-	confFile.Set(os.Getenv(envConfig))
-	runMode.Set(os.Getenv(envMode))
-	flag.Var(&confFile, "conf", "The file system path to Clair's config file.")
-	flag.Var(&runMode, "mode", "The operation mode for this server.")
+	var conf config.Config
+	flag.String("conf", "", "The file system path to Clair's config file.")
+	flag.String("mode", "", "The operation mode for this server, will default to combo.")
 	flag.Parse()
-	if confFile.String() == "" {
-		golog.Fatalf("must provide a -conf flag or set %q in the environment", envConfig)
-	}
+	flag.VisitAll(func(f *flag.Flag) {
+		fv := f.Value.(flag.Getter).Get().(string)
+		var key string
+		switch f.Name {
+		case "conf":
+			key = envConfig
+		case "mode":
+			key = envMode
+		}
+		v, ok := os.LookupEnv(key)
+		if fv == "" && !ok {
+			golog.Fatalf("must provide a -%s value or set %q in the environment", f.Name, key)
+		}
+		if fv == "" && ok {
+			fv = v
+		}
+		switch f.Name {
+		case "conf":
+			if err := cmd.LoadConfig(&conf, fv, true); err != nil {
+				golog.Fatalf("failed loading config: %v", err)
+			}
+		case "mode":
+			if fv == "" {
+				fv = "combo"
+			}
+			m, err := config.ParseMode(fv)
+			if err != nil {
+				golog.Fatalf("bad mode %q: %v", fv, err)
+			}
+			conf.Mode = m
+		}
+	})
+
 	fail := false
 	defer func() {
 		if fail {
@@ -54,13 +77,8 @@ func main() {
 		}
 	}()
 
-	// validate config
-	err := yaml.NewDecoder(confFile.file).Decode(&conf)
-	if err != nil {
-		golog.Fatalf("failed to decode yaml config: %v", err)
-	}
-	conf.Mode = runMode.String()
-	err = config.Validate(&conf)
+	// Grab the warnings to print after the logger is configured.
+	ws, err := config.Validate(&conf)
 	if err != nil {
 		golog.Fatalf("failed to validate config: %v", err)
 	}
@@ -71,77 +89,115 @@ func main() {
 	if err := initialize.Logging(ctx, &conf); err != nil {
 		golog.Fatalf("failed to set up logging: %v", err)
 	}
-	ctx = baggage.ContextWithValues(ctx, label.String("component", "main"))
+	ctx = zlog.ContextWithValues(ctx, "component", "main")
 	zlog.Info(ctx).
-		Str("version", Version).
+		Str("version", cmd.Version).
 		Msg("starting")
+	for _, w := range ws {
+		zlog.Info(ctx).
+			AnErr("lint", &w).Send()
+	}
+	auto.PrintLogs(ctx)
 
-	// Some machinery for starting and stopping server goroutines:
-	down := &Shutdown{}
-	srvs, srvctx := errgroup.WithContext(ctx)
+	// Signal handler, for orderly shutdown.
+	sig, stop := signal.NotifyContext(ctx, append(platformShutdown, os.Interrupt)...)
+	defer stop()
+	zlog.Info(ctx).Msg("registered signal handler")
+	go func() {
+		<-sig.Done()
+		stop()
+		zlog.Info(ctx).Msg("unregistered signal handler")
+	}()
 
-	// Introspection server goroutine.
-	srvs.Go(func() (_ error) {
-		zlog.Info(srvctx).Msg("launching introspection server")
-		i, err := introspection.New(srvctx, conf, nil)
-		if err != nil {
-			zlog.Warn(srvctx).
-				Err(err).Msg("introspection server configuration failed. continuing anyway")
-			return
-		}
-		down.Add(i.Server)
-		if err := i.ListenAndServe(); err != http.ErrServerClosed {
-			zlog.Warn(srvctx).
-				Err(err).Msg("introspection server failed to launch. continuing anyway")
-		}
-		return
-	})
+	srvs, srvctx := errgroup.WithContext(sig)
+	srvs.Go(serveIntrospection(srvctx, &conf))
+	srvs.Go(serveAPI(srvctx, &conf))
 
-	// HTTP API server goroutine.
-	srvs.Go(func() error {
-		zlog.Info(srvctx).Msg("launching http transport")
-		srvs, err := initialize.Services(srvctx, &conf)
+	zlog.Info(ctx).
+		Str("version", cmd.Version).
+		Msg("ready")
+	if err := srvs.Wait(); err != nil {
+		zlog.Error(ctx).
+			Err(err).
+			Msg("fatal error")
+		fail = true
+	}
+}
+
+func serveAPI(ctx context.Context, cfg *config.Config) func() error {
+	return func() error {
+		zlog.Info(ctx).Msg("launching http transport")
+		srvs, err := initialize.Services(ctx, cfg)
 		if err != nil {
 			return fmt.Errorf("service initialization failed: %w", err)
 		}
-		h, err := httptransport.New(srvctx, conf, srvs.Indexer, srvs.Matcher, srvs.Notifier)
+		srv := http.Server{
+			BaseContext: func(_ net.Listener) context.Context {
+				return context.WithoutCancel(ctx)
+			},
+		}
+		srv.Handler, err = httptransport.New(ctx, cfg, srvs.Indexer, srvs.Matcher, srvs.Notifier)
 		if err != nil {
 			return fmt.Errorf("http transport configuration failed: %w", err)
 		}
-		down.Add(h.Server)
-		health.Ready()
-		if err := h.ListenAndServe(); err != http.ErrServerClosed {
-			return fmt.Errorf("http transport failed to launch: %w", err)
+		l, err := net.Listen("tcp", cfg.HTTPListenAddr)
+		if err != nil {
+			return fmt.Errorf("http transport configuration failed: %w", err)
 		}
-		return nil
-	})
-
-	// Signal handler goroutine.
-	go func() {
-		ctx, stop := signal.NotifyContext(ctx, os.Interrupt)
-		defer func() {
-			// Note that we're using a background context here, so that we get a
-			// full timeout if the signal handler has fired.
-			tctx, done := context.WithTimeout(context.Background(), 10*time.Second)
-			err := down.Shutdown(tctx)
+		if cfg.TLS != nil {
+			cfg, err := cfg.TLS.Config()
 			if err != nil {
-				zlog.Error(ctx).Err(err).Msg("error shutting down server")
+				return fmt.Errorf("tls configuration failed: %w", err)
 			}
-			done()
-			stop()
-			zlog.Info(ctx).Msg("unregistered signal handler")
-		}()
-		zlog.Info(ctx).Msg("registered signal handler")
-		select {
-		case <-ctx.Done():
-			zlog.Info(ctx).Stringer("signal", os.Interrupt).Msg("gracefully shutting down")
-		case <-srvctx.Done():
+			cfg.NextProtos = []string{"h2"}
+			srv.TLSConfig = cfg
+			l = tls.NewListener(l, cfg)
 		}
-	}()
+		health.Ready()
 
-	zlog.Info(ctx).Str("version", Version).Msg("ready")
-	if err := srvs.Wait(); err != nil {
-		zlog.Error(ctx).Err(err).Msg("fatal error")
-		fail = true
+		var eg errgroup.Group
+		eg.Go(func() error {
+			if err := srv.Serve(l); !errors.Is(err, http.ErrServerClosed) {
+				return fmt.Errorf("http transport failed to launch: %w", err)
+			}
+			return nil
+		})
+		eg.Go(func() error {
+			<-ctx.Done()
+			ctx, done := context.WithTimeoutCause(context.Background(), 10*time.Second, context.Cause(ctx))
+			defer done()
+			return srv.Shutdown(ctx)
+		})
+		return eg.Wait()
+	}
+}
+
+func serveIntrospection(ctx context.Context, cfg *config.Config) func() error {
+	return func() error {
+		zlog.Info(ctx).Msg("launching introspection server")
+		srv, err := introspection.New(ctx, cfg, nil)
+		if err != nil {
+			zlog.Warn(ctx).
+				Err(err).
+				Msg("introspection server configuration failed; continuing anyway")
+			return nil
+		}
+
+		var eg errgroup.Group
+		eg.Go(func() error {
+			if err := srv.ListenAndServe(); !errors.Is(err, http.ErrServerClosed) {
+				zlog.Warn(ctx).
+					Err(err).
+					Msg("introspection server failed to launch; continuing anyway")
+			}
+			return nil
+		})
+		eg.Go(func() error {
+			<-ctx.Done()
+			ctx, done := context.WithTimeoutCause(context.Background(), 10*time.Second, context.Cause(ctx))
+			defer done()
+			return srv.Shutdown(ctx)
+		})
+		return eg.Wait()
 	}
 }

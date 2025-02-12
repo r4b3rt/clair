@@ -2,9 +2,8 @@
 
 ## CLI Flags And Environment Variables
 
-Clair is configured by a structured yaml file. 
-Each Clair node needs to specify what mode it will run in and a path to a
-configuration file via CLI flags or environment variables.
+Clair is configured by a structured yaml or JSON[^1] file and an optional directory of "merge" and "patch" documents[^1].
+Each Clair node needs to specify what mode it will run in and a path to a configuration file via CLI flags or environment variables.
 
 For example:
 ```shell
@@ -28,8 +27,7 @@ $ clair -conf ./path/to/config.yaml -mode matcher
 ```
 
 The above example starts two Clair nodes using the same configuration.
-One will only run the indexing facilities while the other will only run the
-matching facilities.
+One will only run the indexing facilities while the other will only run the matching facilities.
 
 Environment variables respected by the Go standard library can be specified
 if needed. Some notable examples:
@@ -41,12 +39,49 @@ if needed. Some notable examples:
 If running in "combo" mode you **must** supply the `indexer`, `matcher`,
 and `notifier` configuration blocks in the configuration.
 
+## Configuration dropins
+
+Starting in Clair version `4.7.0`, dropin configuration files are supported.
+
+Given a root configurtaion file of `/etc/clair/config.json`, all files matching the globs `/etc/clair/config.json.d/*.json` and `/etc/clair/config.json.d/*.json-patch` would be loaded in lexical order after the root configuration file.
+Similarly, given `/etc/clair/config.yaml`, all files matching the globs `/etc/clair/config.yaml.d/*.yaml` and `/etc/clair/config.yaml.d/*.yaml-patch` would be loaded.
+Only the extensions `yaml` and `json` are supported, and indicate yaml and JSON formatting, respectively.
+
+The dropin files must have the same extension and format as the root file.
+Dropins with the bare suffix are treated as [merge documents](rfc7386).
+Dropins with the `-patch` suffix are treated as [patch documents](rfc6902) and must contain a valid [RFC 6902](rfc6902) structure.
+Yaml documents must be resolvable to the JSON subset.
+
+Take care with the [merge](rfc7386) behavior around lists; a patch operation may be more suitable.
+The `clairctl check-config` command can be used to ensure a merged configuration is what is intended.
+In addition, placing `test` operations in a patch file that's evaluated last (such as `zz-validate.json-patch`) can be used to have Clair refuse to start if some configuration values are not what is intended.
+
+The application defaults are applied *after* the configuration is loaded and as such, not reflected in the `clairctl check-config` command.
+The output of that command is also not currently suitable to be used to "compile" a config to a single file.
+
+[rfc7386]: https://datatracker.ietf.org/doc/html/rfc7386
+[rfc6902]: https://datatracker.ietf.org/doc/html/rfc6902
+
+## Deprecations and Changes
+
+Starting in version `4.7.0`, unknown keys are disallowed.
+Configurations that looked valid previously and loaded fine may now cause Clair to refuse to start.
+
+In version `4.8.0`, using Jaeger for trace submission was deprecated.
+Configurations that use Jaeger will print a warning.
+In future versions, using the Jaeger format may cause an error.
+
 ## Configuration Reference
+
+Please see the [go module documentation][godoc_config] for additional documentation on defaults and use.
+
+[godoc_config]: https://pkg.go.dev/github.com/quay/clair/config
 
 ```
 http_listen_addr: ""
 introspection_addr: ""
 log_level: ""
+tls: {}
 indexer:
     connstring: ""
     scanlock_retry: 0
@@ -56,7 +91,6 @@ indexer:
     airgap: false
 matcher:
     connstring: ""
-    max_conn_pool: 0
     indexer_addr: ""
     migrations: false
     period: ""
@@ -94,17 +128,37 @@ trace:
         service_name: ""
         tags: nil
         buffer_max: 0
+    otlp:
+	  http: {}
+      grpc: {}
 metrics:
     name: ""
     prometheus:
         endpoint: null
-    dogstatsd:
-        url: ""
 ```
 
 Note: the above just lists every key for completeness. Copy-pasting the above as
 a starting point for configuration will result in some options not having their
 defaults set normally.
+<!---
+The following are purposefully omitted. See comments in the config package for
+more information.
+
+# `$.tls.root_ca`
+# `$.updaters.filter`
+# `$.notifier.webhook.signed`
+# `$.auth.keyserver`
+# `$.auth.keyserver.api`
+# `$.auth.keyserver.intraservice`
+# `$.trace.otlp.http.client_tls`
+# `$.trace.otlp.http.client_tls.root_ca`
+# `$.trace.otlp.grpc.client_tls`
+# `$.trace.otlp.grpc.client_tls.root_ca`
+# `$.metrics.otlp.http.client_tls`
+# `$.metrics.otlp.http.client_tls.root_ca`
+# `$.metrics.otlp.grpc.client_tls`
+# `$.metrics.otlp.grpc.client_tls.root_ca`
+-->
 
 ### `$.http_listen_addr`
 A string in `<host>:<port>` format where `<host>` can be an empty string.
@@ -129,8 +183,23 @@ One of the following strings:
 * fatal
 * panic
 
+### `$.tls`
+TLS is a map containing the config for serving the HTTP API over TLS (and
+HTTP/2).
+
+#### `$.tls.cert`
+The TLS certificate to be used. Must be a full-chain certificate, as in nginx.
+
+#### `$.tls.key`
+A key file for the TLS certificate. Encryption is not supported on the key.
+
 ### `$.indexer`
 Indexer provides Clair Indexer node configuration.
+
+#### `$.indexer.airgap`
+Disables HTTP access to the Internet for indexers and fetchers.
+Private IPv4 and IPv6 addresses are allowed.
+Database connections are unaffected.
 
 #### `$.indexer.connstring`
 A Postgres connection string.
@@ -139,6 +208,17 @@ Accepts a format as a url (e.g.,
 `postgres://pqgotest:password@localhost/pqgotest?sslmode=verify-full`)
 or a libpq connection string (e.g.,
 `user=pqgotest dbname=pqgotest sslmode=verify-full`).
+
+#### `$.indexer.index_report_request_concurrency`
+Integer.
+
+Rate limits the number of index report creation requests.
+
+Setting this to 0 will attempt to auto-size this value. Setting a negative value
+means "unlimited." The auto-sizing is a multiple of the number of available
+cores.
+
+The API will return a 429 status code if concurrency is exceeded.
 
 #### `$.indexer.scanlock_retry`
 A positive integer representing seconds.
@@ -159,14 +239,28 @@ A boolean value.
 Whether Indexer nodes handle migrations to their database.
 
 #### `$.indexer.scanner`
-A map with the name of a particular scanner and arbitrary yaml as a value.
+Indexer configurations.
 
 Scanner allows for passing configuration options to layer scanners.
 The scanner will have this configuration passed to it on construction if
 designed to do so.
 
+#### `$.indexer.scanner.dist`
+A map with the name of a particular scanner and arbitrary yaml as a value.
+
+#### `$.indexer.scanner.package`
+A map with the name of a particular scanner and arbitrary yaml as a value.
+
+#### `$.indexer.scanner.repo`
+A map with the name of a particular scanner and arbitrary yaml as a value.
+
 ### `$.matcher`
 Matcher provides Clair matcher node configuration.
+
+#### `$.matcher.cache_age`
+Duration string.
+
+Controls how long clients should be hinted to cache responses for.
 
 #### `$.matcher.connstring`
 A Postgres connection string.
@@ -176,13 +270,15 @@ Accepts a format as a url (e.g.,
 or a libpq connection string (e.g.,
 `user=pqgotest dbname=pqgotest sslmode=verify-full`).
 
-
 #### `$.matcher.max_conn_pool`
 A positive integer limiting the database connection pool size.
 
 Clair allows for a custom connection pool size.
 This number will directly set how many active database
 connections are allowed concurrently.
+
+This parameter will be ignored in a future version.
+Users should configure this through the connection string.
 
 #### `$.matcher.indexer_addr`
 A string in `<host>:<port>` format where `<host>` can be an empty string.
@@ -200,7 +296,7 @@ A time.ParseDuration parseable string.
 
 Determines how often updates for new security advisories will take place.
 
-Defaults to 30 minutes.
+Defaults to 6 hours.
 
 #### `$.matcher.disable_updaters`
 A boolean value.
@@ -226,16 +322,18 @@ Matchers provides configuration for the in-tree Matchers and RemoteMatchers.
 A list of string values informing the matcher factory about enabled matchers.
 
 If the value is nil the default list of Matchers will run:
-* alpine
-* aws
-* debian
+* alpine-matcher
+* aws-matcher
+* debian-matcher
+* gobin
+* java-maven
 * oracle
 * photon
 * python
 * rhel
+* rhel-container-matcher
 * suse
-* ubuntu
-* crda
+* ubuntu-matcher
 
 If an empty list is provided zero matchers will run.
 
@@ -264,8 +362,9 @@ If the value is nil (or `null` in yaml) the default set of Updaters will run:
 * aws
 * debian
 * oracle
+* osv
 * photon
-* pyupio
+* rhcc
 * rhel
 * suse
 * ubuntu
@@ -394,7 +493,7 @@ bool value
 
 Whether the configured queue uses an auto_delete policy.
 
-#### `$.notifier.amqp.exchange.routing_key`
+#### `$.notifier.amqp.routing_key`
 string value
 
 The name of the routing key each notification will be sent with.
@@ -483,15 +582,15 @@ string value
 
 The filesystem path where a tls private key can be read.
 
-#### `$.notifier.stomp.tls.user`
-Configures login information for connecting to a STOMP broker.
+#### `$.notifier.stomp.user`
+Configures login details for the STOMP broker.
 
-#### `$.notifier.stomp.tls.login`
+#### `$.notifier.stomp.user.login`
 string value
 
 The STOMP login to connect with.
 
-#### `$.notifier.stomp.tls.passcode`
+#### `$.notifier.stomp.user.passcode`
 string value
 
 The STOMP passcode to connect with.
@@ -499,7 +598,8 @@ The STOMP passcode to connect with.
 ### `$.auth`
 Defines ClairV4's external and intra-service JWT based authentication.
 
-If multiple auth mechanisms are defined, the Keyserver is preferred.
+If multiple auth mechanisms are defined, Clair will pick one. Currently, there
+are not multiple mechanisms.
 
 ### `$.auth.psk`
 Defines preshared key authentication.
@@ -516,34 +616,25 @@ a list of string value
 A list of JWT issuers to verify. An empty list will accept any issuer in a
 JWT claim.
 
-### `$.auth.keyserver`
-Defines Quay keyserver authentication.
-
-#### `$.auth.keyserver.api`
-a string value
-
-The API where Quay Keyserver can be reached.
-
-#### `$.auth.keyserver.intraservice`
-a string value
-
-A key shared between all Clair nodes for intra-service JWT authentication.
-
 ### `$.trace`
 Defines distributed tracing configuration based on OpenTelemetry.
 
 #### `$.trace.name`
-a string value
-
-The name of the application traces will belong to.
+Which submission format to use, one of:
+- jaeger
+- otlp
+- sentry
 
 #### `$.trace.probability`
 a float value
 
 The probability a trace will occur.
 
-#### `$.trace.jaeger`
+### `$.trace.jaeger`
 Defines values for Jaeger tracing.
+
+***NOTE***: Jaeger has deprecated using the `jaeger` protocol and encouraging users to migrate to OTLP,
+which Jaeger can ingest natively.
 
 #### `$.trace.jaeger.agent`
 Defines values for configuring delivery to a Jaeger agent.
@@ -564,7 +655,7 @@ An address in `<host>:<post>` syntax where traces can be submitted.
 #### `$.trace.jaeger.collector.username`
 a string value
 
-#### `$.trace.jaeger.collector.passwordd`
+#### `$.trace.jaeger.collector.password`
 a string value
 
 #### `$.trace.jaeger.service_name`
@@ -575,6 +666,94 @@ a mapping of a string to a string
 
 #### `$.trace.jaeger.buffer_max`
 an integer value
+
+### `$.trace.otlp`
+Configuration for OTLP traces.
+
+Only one of the `http` or `grpc` keys should be provided.
+
+#### `$.trace.otlp.http`
+Configuration for OTLP traces submitted by HTTP.
+
+##### `$.trace.otlp.http.url_path`
+Request path to use for submissions.
+Defaults to `/v1/traces`.
+
+##### `$.trace.otlp.http.compression`
+Compression for payloads.
+One of:
+- gzip
+- none
+
+##### `$.trace.otlp.http.endpoint`
+`Host:port` for submission. Defaults to `localhost:4318`.
+
+##### `$.trace.otlp.http.headers`
+Key-value pairs of additional headers for submissions.
+
+##### `$.trace.otlp.http.insecure`
+Use HTTP instead of HTTPS.
+
+##### `$.trace.otlp.http.timeout`
+Maximum of of time for a trace submission.
+
+##### `$.trace.otlp.http.client_tls.cert`
+Client certificate for connection.
+
+##### `$.trace.otlp.http.client_tls.key`
+Key for the certificate specified in `cert`.
+
+#### `$.trace.otlp.grpc`
+Configuration for OTLP traces submitted by gRPC.
+
+##### `$.trace.otlp.grpc.reconnect`
+Sets the minimum time between connection attempts.
+
+##### `$.trace.otlp.grpc.service_config`
+A string containing a JSON-format gRPC service config.
+
+##### `$.trace.otlp.grpc.compression`
+Compression for payloads.
+One of:
+- gzip
+- none
+
+##### `$.trace.otlp.grpc.endpoint`
+`Host:port` for submission. Defaults to `localhost:4317`.
+
+##### `$.trace.otlp.grpc.headers`
+Key-value pairs of additional headers for submissions.
+
+##### `$.trace.otlp.grpc.insecure`
+Do not verify the server certificate.
+
+##### `$.trace.otlp.grpc.timeout`
+Maximum of of time for a trace submission.
+
+##### `$.trace.otlp.grpc.client_tls.cert`
+Client certificate for connection.
+
+##### `$.trace.otlp.grpc.client_tls.key`
+Key for the certificate specified in `cert`.
+
+### `$.trace.sentry`
+Configuration for submitting traces to Sentry.
+
+This is done via OpenTelemetry instrumentation, so may not provide identical
+results compared to other tracing backends or native Sentry instrumentation.
+
+There's no integration for error submission.
+This means that alternative implementations of the Sentry API that do not support submitting traces (such as [GlitchTip]) are not usable.
+
+[GlitchTip]: https://glitchtip.com/
+
+#### `$.trace.sentry.dsn`
+Sentry DSN to use.
+See also [`sentry-go.ClientOptions`](https://pkg.go.dev/github.com/getsentry/sentry-go#ClientOptions).
+
+#### `$.trace.sentry.environment`
+Sentry environment to use.
+See also [`sentry-go.ClientOptions`](https://pkg.go.dev/github.com/getsentry/sentry-go#ClientOptions).
 
 ### `$.metrics`
 Defines distributed tracing configuration based on OpenTelemetry.
@@ -589,3 +768,76 @@ Configuration for a prometheus metrics exporter.
 a string value
 
 Defines the path where metrics will be served.
+
+### `$.metrics.otlp`
+Configuration for OTLP metrics.
+
+Only one of the `http` or `grpc` keys should be provided.
+
+#### `$.metrics.otlp.http`
+Configuration for OTLP metrics submitted by HTTP.
+
+##### `$.metrics.otlp.http.url_path`
+Request path to use for submissions.
+Defaults to `/v1/metrics`.
+
+##### `$.metrics.otlp.http.compression`
+Compression for payloads.
+One of:
+- gzip
+- none
+
+##### `$.metrics.otlp.http.endpoint`
+`Host:port` for submission. Defaults to `localhost:4318`.
+
+##### `$.metrics.otlp.http.headers`
+Key-value pairs of additional headers for submissions.
+
+##### `$.metrics.otlp.http.insecure`
+Use HTTP instead of HTTPS.
+
+##### `$.metrics.otlp.http.timeout`
+Maximum of of time for a metrics submission.
+
+##### `$.metrics.otlp.http.client_tls.cert`
+Client certificate for connection.
+
+##### `$.metrics.otlp.http.client_tls.key`
+Key for the certificate specified in `cert`.
+
+#### `$.metrics.otlp.grpc`
+Configuration for OTLP metrics submitted by gRPC.
+
+##### `$.metrics.otlp.grpc.reconnect`
+Sets the minimum time between connection attempts.
+
+##### `$.metrics.otlp.grpc.service_config`
+A string containing a JSON-format gRPC service config.
+
+##### `$.metrics.otlp.grpc.compression`
+Compression for payloads.
+One of:
+- gzip
+- none
+
+##### `$.metrics.otlp.grpc.endpoint`
+`Host:port` for submission. Defaults to `localhost:4318`.
+
+##### `$.metrics.otlp.grpc.headers`
+Key-value pairs of additional headers for submissions.
+
+##### `$.metrics.otlp.grpc.insecure`
+Use HTTP instead of HTTPS.
+
+##### `$.metrics.otlp.grpc.timeout`
+Maximum of of time for a metrics submission.
+
+##### `$.metrics.otlp.grpc.client_tls.cert`
+Client certificate for connection.
+
+##### `$.metrics.otlp.grpc.client_tls.key`
+Key for the certificate specified in `cert`.
+
+* * *
+
+[^1]: Support added in version `4.7.0`.

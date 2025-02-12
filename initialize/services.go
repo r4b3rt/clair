@@ -2,30 +2,34 @@ package initialize
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
 	"net/http/cookiejar"
 	"time"
 
+	"github.com/go-jose/go-jose/v3/jwt"
+	"github.com/jackc/pgx/v4/pgxpool"
+	"github.com/quay/clair/config"
+	"github.com/quay/claircore/datastore/postgres"
 	"github.com/quay/claircore/enricher/cvss"
 	"github.com/quay/claircore/libindex"
 	"github.com/quay/claircore/libvuln"
 	"github.com/quay/claircore/libvuln/driver"
+	"github.com/quay/claircore/pkg/ctxlock"
 	"github.com/quay/zlog"
-	"go.opentelemetry.io/otel/baggage"
-	"go.opentelemetry.io/otel/label"
 	"golang.org/x/net/publicsuffix"
-	"gopkg.in/square/go-jose.v2/jwt"
 
 	clairerror "github.com/quay/clair/v4/clair-error"
-	"github.com/quay/clair/v4/config"
 	"github.com/quay/clair/v4/httptransport"
 	"github.com/quay/clair/v4/httptransport/client"
 	"github.com/quay/clair/v4/indexer"
 	"github.com/quay/clair/v4/internal/httputil"
 	"github.com/quay/clair/v4/matcher"
-	notifier "github.com/quay/clair/v4/notifier/service"
+	"github.com/quay/clair/v4/notifier"
+	notifierpg "github.com/quay/clair/v4/notifier/postgres"
+	"github.com/quay/clair/v4/notifier/service"
 )
 
 const (
@@ -52,9 +56,7 @@ type Srv struct {
 // Services configures the services needed for a given mode according to the
 // provided configuration.
 func Services(ctx context.Context, cfg *config.Config) (*Srv, error) {
-	ctx = baggage.ContextWithValues(ctx,
-		label.String("component", "initialize/Services"),
-	)
+	ctx = zlog.ContextWithValues(ctx, "component", "initialize/Services")
 	zlog.Info(ctx).Msg("begin service initialization")
 	defer zlog.Info(ctx).Msg("end service initialization")
 
@@ -108,44 +110,79 @@ func Services(ctx context.Context, cfg *config.Config) (*Srv, error) {
 	return &srv, nil
 }
 
+// BUG(hank) The various resources (database connections, lock services)
+// constructed in some internal functions are not properly cleaned up.
+
 func localIndexer(ctx context.Context, cfg *config.Config) (indexer.Service, error) {
 	const msg = "failed to initialize indexer: "
 	mkErr := func(err error) *clairerror.ErrNotInitialized {
 		return &clairerror.ErrNotInitialized{msg + err.Error()}
 	}
-	opts := libindex.Opts{
-		ConnString:           cfg.Indexer.ConnString,
+
+	pool, err := postgres.Connect(ctx, cfg.Indexer.ConnString, "libindex")
+	if err != nil {
+		return nil, mkErr(err)
+	}
+	store, err := postgres.InitPostgresIndexerStore(ctx, pool, cfg.Indexer.Migrations)
+	if err != nil {
+		return nil, mkErr(err)
+	}
+	locker, err := ctxlock.New(ctx, pool)
+	if err != nil {
+		return nil, mkErr(err)
+	}
+
+	opts := libindex.Options{
+		Store:                store,
+		Locker:               locker,
 		ScanLockRetry:        time.Duration(cfg.Indexer.ScanLockRetry) * time.Second,
 		LayerScanConcurrency: cfg.Indexer.LayerScanConcurrency,
-		Migrations:           cfg.Indexer.Migrations,
-		Airgap:               cfg.Indexer.Airgap,
 	}
 	if cfg.Indexer.Scanner.Package != nil {
 		opts.ScannerConfig.Package = make(map[string]func(interface{}) error, len(cfg.Indexer.Scanner.Package))
 		for name, node := range cfg.Indexer.Scanner.Package {
-			opts.ScannerConfig.Package[name] = node.Decode
+			node := node
+			opts.ScannerConfig.Package[name] = func(v interface{}) error {
+				b, err := json.Marshal(node)
+				if err != nil {
+					return err
+				}
+				return json.Unmarshal(b, v)
+			}
 		}
 	}
 	if cfg.Indexer.Scanner.Dist != nil {
 		opts.ScannerConfig.Dist = make(map[string]func(interface{}) error, len(cfg.Indexer.Scanner.Dist))
 		for name, node := range cfg.Indexer.Scanner.Dist {
-			opts.ScannerConfig.Dist[name] = node.Decode
+			node := node
+			opts.ScannerConfig.Dist[name] = func(v interface{}) error {
+				b, err := json.Marshal(node)
+				if err != nil {
+					return err
+				}
+				return json.Unmarshal(b, v)
+			}
 		}
 	}
 	if cfg.Indexer.Scanner.Repo != nil {
 		opts.ScannerConfig.Repo = make(map[string]func(interface{}) error, len(cfg.Indexer.Scanner.Repo))
 		for name, node := range cfg.Indexer.Scanner.Repo {
-			opts.ScannerConfig.Repo[name] = node.Decode
+			node := node
+			opts.ScannerConfig.Repo[name] = func(v interface{}) error {
+				b, err := json.Marshal(node)
+				if err != nil {
+					return err
+				}
+				return json.Unmarshal(b, v)
+			}
 		}
 	}
-	tr := http.DefaultTransport.(*http.Transport).Clone()
-	// Use an empty claim because this shouldn't be talking to something that
-	// needs preconfigured authz. Callers should be providing credentials to the
-	// indexing process in the submitted manifest.
-	c, _, err := cfg.Client(tr, nil)
+	c, err := httputil.NewClient(ctx, cfg.Indexer.Airgap)
 	if err != nil {
 		return nil, mkErr(err)
 	}
+
+	opts.FetchArena = libindex.NewRemoteFetchArena(c, "")
 
 	s, err := libindex.New(ctx, &opts, c)
 	if err != nil {
@@ -167,16 +204,19 @@ func remoteIndexer(ctx context.Context, cfg *config.Config, addr string) (indexe
 }
 
 func remoteClient(ctx context.Context, cfg *config.Config, claim jwt.Claims, addr string) (*client.HTTP, error) {
-	tr := http.DefaultTransport.(*http.Transport).Clone()
-	c, auth, err := cfg.Client(tr, &claim)
-	switch {
-	case err != nil:
+	c, err := httputil.NewClient(ctx, false) // ???
+	if err != nil {
 		return nil, err
-	case !auth && cfg.Auth.Any():
-		return nil, errors.New("client authorization required but not provided")
-	default: // OK
 	}
-	return client.NewHTTP(ctx, client.WithAddr(addr), client.WithClient(c))
+	opts := []client.Option{client.WithAddr(addr), client.WithClient(c)}
+	if cfg.Auth.Any() {
+		s, err := httputil.NewSigner(ctx, cfg, claim)
+		if err != nil {
+			return nil, err
+		}
+		opts = append(opts, client.WithSigner(s))
+	}
+	return client.NewHTTP(ctx, opts...)
 }
 
 func localMatcher(ctx context.Context, cfg *config.Config) (matcher.Service, error) {
@@ -203,18 +243,44 @@ func localMatcher(ctx context.Context, cfg *config.Config) (matcher.Service, err
 	}
 	updaterConfigs := make(map[string]driver.ConfigUnmarshaler)
 	for name, node := range cfg.Updaters.Config {
-		updaterConfigs[name] = node.Decode
+		node := node
+		updaterConfigs[name] = func(v interface{}) error {
+			b, err := json.Marshal(node)
+			if err != nil {
+				return err
+			}
+			return json.Unmarshal(b, v)
+		}
 	}
 	matcherConfigs := make(map[string]driver.MatcherConfigUnmarshaler)
 	for name, node := range cfg.Matchers.Config {
-		matcherConfigs[name] = node.Decode
+		node := node
+		matcherConfigs[name] = func(v interface{}) error {
+			b, err := json.Marshal(node)
+			if err != nil {
+				return err
+			}
+			return json.Unmarshal(b, v)
+		}
 	}
-	s, err := libvuln.New(ctx, &libvuln.Opts{
-		MaxConnPool:     int32(cfg.Matcher.MaxConnPool),
-		ConnString:      cfg.Matcher.ConnString,
-		Migrations:      cfg.Matcher.Migrations,
+	pool, err := postgres.Connect(ctx, cfg.Matcher.ConnString, "libvuln")
+	if err != nil {
+		return nil, mkErr(err)
+	}
+	store, err := postgres.InitPostgresMatcherStore(ctx, pool, cfg.Matcher.Migrations)
+	if err != nil {
+		return nil, mkErr(err)
+	}
+	locker, err := ctxlock.New(ctx, pool)
+	if err != nil {
+		return nil, mkErr(err)
+	}
+
+	s, err := libvuln.New(ctx, &libvuln.Options{
+		Store:           store,
+		Locker:          locker,
 		UpdaterSets:     cfg.Updaters.Sets,
-		UpdateInterval:  cfg.Matcher.Period,
+		UpdateInterval:  time.Duration(cfg.Matcher.Period),
 		UpdaterConfigs:  updaterConfigs,
 		UpdateRetention: cfg.Matcher.UpdateRetention,
 		MatcherNames:    cfg.Matchers.Names,
@@ -250,27 +316,59 @@ func localNotifier(ctx context.Context, cfg *config.Config, i indexer.Service, m
 		}
 	}
 
-	tr := http.DefaultTransport.(*http.Transport).Clone()
-	c, _, err := cfg.Client(tr, &notifierClaim)
+	c, err := httputil.NewClient(ctx, false) // No airgap flag.
+	if err != nil {
+		return nil, mkErr(err)
+	}
+	signer, err := httputil.NewSigner(ctx, cfg, notifierClaim)
 	if err != nil {
 		return nil, mkErr(err)
 	}
 
-	s, err := notifier.New(ctx, notifier.Opts{
-		DeliveryInterval: cfg.Notifier.DeliveryInterval,
-		ConnString:       cfg.Notifier.ConnString,
+	ncfg := &cfg.Notifier
+	poolcfg, err := pgxpool.ParseConfig(ncfg.ConnString)
+	if err != nil {
+		return nil, mkErr(err)
+	}
+	if cfg.Notifier.Migrations {
+		if err := notifierpg.Init(ctx, poolcfg.ConnConfig); err != nil {
+			return nil, mkErr(err)
+		}
+	}
+	pool, err := pgxpool.ConnectConfig(ctx, poolcfg)
+	if err != nil {
+		return nil, mkErr(err)
+	}
+	store := notifierpg.NewStore(pool)
+	locks, err := ctxlock.New(ctx, pool)
+	if err != nil {
+		return nil, mkErr(err)
+	}
+
+	s, err := service.New(ctx, store, locks, service.Opts{
+		DeliveryInterval: time.Duration(cfg.Notifier.DeliveryInterval),
 		Indexer:          i,
 		Matcher:          m,
 		Client:           c,
-		Migrations:       cfg.Notifier.Migrations,
-		PollInterval:     cfg.Notifier.PollInterval,
+		Signer:           signer,
+		PollInterval:     time.Duration(cfg.Notifier.PollInterval),
 		DisableSummary:   cfg.Notifier.DisableSummary,
 		Webhook:          cfg.Notifier.Webhook,
 		AMQP:             cfg.Notifier.AMQP,
 		STOMP:            cfg.Notifier.STOMP,
 	})
-	if err != nil {
+	switch {
+	case err == nil:
+	case errors.Is(err, service.ErrNoDelivery):
+		zlog.Info(ctx).AnErr("reason", err).Msg("notifier disabled")
+		return nil, nil
+	default:
 		return nil, mkErr(err)
 	}
+	go func() {
+		if err := s.Run(ctx); err != context.Canceled {
+			zlog.Error(ctx).Err(err).Msg("unexpected notifier error")
+		}
+	}()
 	return s, nil
 }

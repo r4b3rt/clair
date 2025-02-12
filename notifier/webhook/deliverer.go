@@ -2,16 +2,18 @@ package webhook
 
 import (
 	"context"
+	"errors"
 	"net/http"
+	"net/url"
 	"sync"
 
 	"github.com/google/uuid"
+	"github.com/quay/clair/config"
 	"github.com/quay/zlog"
-	"go.opentelemetry.io/otel/baggage"
-	"go.opentelemetry.io/otel/label"
 
 	clairerror "github.com/quay/clair/v4/clair-error"
 	"github.com/quay/clair/v4/internal/codec"
+	"github.com/quay/clair/v4/internal/httputil"
 	"github.com/quay/clair/v4/notifier"
 )
 
@@ -19,25 +21,46 @@ import (
 var signedOnce sync.Once
 
 type Deliverer struct {
-	conf Config
 	// a client to use for POSTing webhooks
-	c *http.Client
+	c        *http.Client
+	callback *url.URL
+	target   *url.URL
+	signer   Signer
+	headers  http.Header
+}
+
+type Signer interface {
+	Sign(context.Context, *http.Request) error
 }
 
 // New returns a new webhook Deliverer
-func New(conf Config, client *http.Client) (*Deliverer, error) {
-	var c Config
+func New(conf *config.Webhook, client *http.Client, signer Signer) (*Deliverer, error) {
+	switch {
+	case conf == nil:
+		return nil, errors.New("config not provided")
+	case client == nil:
+		return nil, errors.New("http client not provided")
+	}
+	var d Deliverer
 	var err error
-	if c, err = conf.Validate(); err != nil {
+
+	d.callback, err = url.Parse(conf.Callback)
+	if err != nil {
 		return nil, err
 	}
-	if client == nil {
-		client = http.DefaultClient
+	d.target, err = url.Parse(conf.Target)
+	if err != nil {
+		return nil, err
 	}
-	return &Deliverer{
-		conf: c,
-		c:    client,
-	}, nil
+	d.headers = conf.Headers.Clone()
+	if d.headers == nil {
+		d.headers = make(map[string][]string)
+	}
+	d.headers.Set("content-type", "application/json")
+	d.signer = signer
+
+	d.c = client
+	return &d, nil
 }
 
 func (d *Deliverer) Name() string {
@@ -48,12 +71,12 @@ func (d *Deliverer) Name() string {
 //
 // Deliver POSTS a webhook data structure to the configured target.
 func (d *Deliverer) Deliver(ctx context.Context, nID uuid.UUID) error {
-	ctx = baggage.ContextWithValues(ctx,
-		label.String("component", "notifier/webhook/Deliverer.Deliver"),
-		label.Stringer("notification_id", nID),
+	ctx = zlog.ContextWithValues(ctx,
+		"component", "notifier/webhook/Deliverer.Deliver",
+		"notification_id", nID.String(),
 	)
 
-	callback, err := d.conf.callback.Parse(nID.String())
+	callback, err := d.callback.Parse(nID.String())
 	if err != nil {
 		return err
 	}
@@ -63,34 +86,31 @@ func (d *Deliverer) Deliver(ctx context.Context, nID uuid.UUID) error {
 		Callback:       *callback,
 	}
 
-	req := &http.Request{
-		URL:    d.conf.target,
-		Header: d.conf.Headers,
-		Body:   codec.JSONReader(&wh),
-		Method: http.MethodPost,
+	req, err := httputil.NewRequestWithContext(ctx, http.MethodPost, d.target.String(), codec.JSONReader(&wh))
+	if err != nil {
+		return err
 	}
-
-	// sign a jwt using key manager's private key
-	if d.conf.Signed {
-		signedOnce.Do(func() {
-			zlog.Warn(ctx).Msg(`"signed" configuration key no longer does anything`)
-			zlog.Warn(ctx).Msg(`specifying "signed" will be an error in the future`)
-			// Make good on this threat in... 4.4?
-		})
+	for k, vs := range d.headers {
+		for _, v := range vs {
+			req.Header.Add(k, v)
+		}
+	}
+	if d.signer != nil {
+		if err := d.signer.Sign(ctx, req); err != nil {
+			return err
+		}
 	}
 
 	zlog.Info(ctx).
 		Stringer("callback", callback).
-		Stringer("target", d.conf.target).
+		Stringer("target", d.target).
 		Msg("dispatching webhook")
 
 	resp, err := d.c.Do(req)
-	if resp != nil {
-		defer resp.Body.Close()
-	}
 	if err != nil {
 		return &clairerror.ErrDeliveryFailed{E: err}
 	}
+	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		return &clairerror.ErrDeliveryFailed{
 			E: &clairerror.ErrRequestFail{

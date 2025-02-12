@@ -9,17 +9,21 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-	"github.com/quay/clair/v4/notifier"
+	"github.com/quay/clair/config"
 	"github.com/quay/claircore"
 	"github.com/quay/claircore/test/integration"
-	samqp "github.com/streadway/amqp"
+	"github.com/quay/zlog"
+	amqp "github.com/rabbitmq/amqp091-go"
 	"golang.org/x/sync/errgroup"
+
+	"github.com/quay/clair/v4/notifier"
 )
 
 // TestDirectDeliverer confirms delivery of notifications directly
 // to the AMQP queue with rollup works correctly.
 func TestDirectDeliverer(t *testing.T) {
 	integration.Skip(t)
+	ctx := zlog.Test(context.Background(), t)
 	// test start
 	table := []struct {
 		name         string
@@ -28,43 +32,43 @@ func TestDirectDeliverer(t *testing.T) {
 		expectedMsgs int
 	}{
 		{
-			name:         "check 0",
+			name:         "0",
 			rollup:       0,
 			notes:        1,
 			expectedMsgs: 1,
 		},
 		{
-			name:         "check 1",
+			name:         "1",
 			rollup:       1,
 			notes:        5,
 			expectedMsgs: 5,
 		},
 		{
-			name:         "check rollup overflow",
+			name:         "RollupOverflow",
 			rollup:       10,
 			notes:        5,
 			expectedMsgs: 1,
 		},
 		{
-			name:         "check odds",
+			name:         "Odds",
 			rollup:       3,
 			notes:        7,
 			expectedMsgs: 3,
 		},
 		{
-			name:         "check odds rollup",
+			name:         "OddsRollup",
 			rollup:       3,
 			notes:        8,
 			expectedMsgs: 3,
 		},
 		{
-			name:         "check odds notes",
+			name:         "OddsNotes",
 			rollup:       4,
 			notes:        7,
 			expectedMsgs: 2,
 		},
 		{
-			name:         "check large",
+			name:         "Large",
 			rollup:       100,
 			notes:        1000,
 			expectedMsgs: 10,
@@ -75,13 +79,14 @@ func TestDirectDeliverer(t *testing.T) {
 	if uri == "" {
 		uri = defaultRabbitMQURI
 	}
-	conn, err := samqp.Dial(uri)
+	t.Logf("using uri: %q", uri)
+	conn, err := amqp.Dial(uri)
 	if err != nil {
 		t.Fatalf("failed to connect to broker at %v: %v", uri, err)
 	}
 	defer conn.Close()
 	// our test assumes a default exchange
-	exchange := Exchange{
+	exchange := config.Exchange{
 		Name:       "",
 		Type:       "direct",
 		Durable:    true,
@@ -89,10 +94,11 @@ func TestDirectDeliverer(t *testing.T) {
 	}
 	for _, tt := range table {
 		t.Run(tt.name, func(t *testing.T) {
+			ctx := zlog.Test(ctx, t)
 			// rabbitmq queue declare
-			var (
-				queueAndKey = tt.name + "-" + uuid.New().String()
-			)
+
+			queueAndKey := tt.name + "-" + uuid.New().String()
+
 			ch, err := conn.Channel()
 			if err != nil {
 				t.Fatalf("failed to obtain channel from broker %v: %v", uri, err)
@@ -113,7 +119,7 @@ func TestDirectDeliverer(t *testing.T) {
 			}
 
 			// deliverer test
-			conf := Config{
+			conf := config.AMQP{
 				Direct: true,
 				Rollup: tt.rollup,
 				// values come from rabbitmq setup
@@ -145,17 +151,17 @@ func TestDirectDeliverer(t *testing.T) {
 			g := errgroup.Group{}
 			for i := 0; i < 4; i++ {
 				g.Go(func() error {
-					d, err := NewDirectDeliverer(conf)
+					d, err := NewDirectDeliverer(&conf)
 					if err != nil {
 						return fmt.Errorf("could not create deliverer: %v", err)
 					}
-					err = d.Notifications(context.TODO(), notes)
+					err = d.Notifications(ctx, notes)
 					if err != nil {
 						return fmt.Errorf("failed to provide notifications to direct deliverer: %v", err)
 					}
 					// we simply need to check for an error. rabbitmq
 					// will error if message cannot be delivered to broker
-					err = d.Deliver(context.TODO(), noteID)
+					err = d.Deliver(ctx, noteID)
 					if err != nil {
 						return fmt.Errorf("failed to deliver message: %v", err)
 					}
@@ -167,7 +173,7 @@ func TestDirectDeliverer(t *testing.T) {
 			}
 
 			// create consumer
-			consumerConn, err := samqp.Dial(uri)
+			consumerConn, err := amqp.Dial(uri)
 			if err != nil {
 				t.Fatalf("failed to create consumer connection: %v", err)
 			}

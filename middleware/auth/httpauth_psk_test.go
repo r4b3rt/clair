@@ -2,6 +2,7 @@ package auth
 
 import (
 	"bytes"
+	"context"
 	"encoding/base64"
 	"fmt"
 	"math/rand"
@@ -13,8 +14,10 @@ import (
 	"testing/quick"
 	"time"
 
-	"gopkg.in/square/go-jose.v2"
-	"gopkg.in/square/go-jose.v2/jwt"
+	"github.com/go-jose/go-jose/v3"
+	"github.com/go-jose/go-jose/v3/jwt"
+
+	"github.com/quay/clair/v4/internal/httputil"
 )
 
 type pskTestcase struct {
@@ -88,6 +91,7 @@ func (tc *pskTestcase) Handler(t *testing.T) http.Handler {
 // Roundtrips returns a function suitable for passing to quick.Check.
 func roundtrips(t *testing.T) func(*pskTestcase) bool {
 	return func(tc *pskTestcase) bool {
+		ctx := context.Background()
 		t.Log(tc)
 		// Set up the jwt signer.
 		sk := jose.SigningKey{
@@ -122,7 +126,7 @@ func roundtrips(t *testing.T) func(*pskTestcase) bool {
 		defer srv.Close()
 
 		// Mint a request.
-		req, err := http.NewRequest(http.MethodGet, srv.URL, nil)
+		req, err := httputil.NewRequestWithContext(ctx, http.MethodGet, srv.URL, nil)
 		if err != nil {
 			t.Error(err)
 			return false

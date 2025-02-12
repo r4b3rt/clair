@@ -46,7 +46,7 @@ type Notificationer interface {
 	// them with the provided notification id
 	//
 	// PutNotifications must update the latest update operation for the provided
-	// updater in such a way that UpdateOperation returns the the provided update
+	// updater in such a way that UpdateOperation returns the provided update
 	// operation id when queried with the updater name
 	//
 	// PutNotifications must create a Receipt with status created status on
@@ -58,14 +58,13 @@ type Notificationer interface {
 	//
 	// After this method returns all methods on the Receipter interface must work accordingly.
 	PutReceipt(ctx context.Context, updater string, r Receipt) error
-	// DeleteNotifications garbage collects all notifications associated
-	// with a notification id.
+	// CollectNotifications garbage collects all notifications.
 	//
 	// Normally Receipter.SetDeleted will be issues first, however
-	// application logic may decide to gc notifications which have not been
+	// application logic may decide to GC notifications which have not been
 	// set deleted after some period of time, thus this condition should not
 	// be checked.
-	DeleteNotifications(ctx context.Context, id uuid.UUID) error
+	CollectNotifications(ctx context.Context) error
 }
 
 // Receipter implements persistence methods for Receipt models

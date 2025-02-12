@@ -7,8 +7,6 @@ import (
 
 	"github.com/quay/claircore/libvuln/driver"
 	"github.com/quay/zlog"
-	"go.opentelemetry.io/otel/baggage"
-	"go.opentelemetry.io/otel/label"
 
 	clairerror "github.com/quay/clair/v4/clair-error"
 	"github.com/quay/clair/v4/matcher"
@@ -22,19 +20,18 @@ const (
 // PollerOpt applies a configuration to a Poller
 type PollerOpt func(*Poller) error
 
-// Poller implements new Update Operation discovery via
-// an event channel.
+// Poller implements new Update Operation discovery via an event channel.
 type Poller struct {
-	// the interval to poll a Matcher node.
-	interval time.Duration
 	// a store to retrieve known UOIDs and compare
 	// with the polled UOIDs.
 	store Store
 	// a differ to retrieve latest update operations
 	differ matcher.Differ
+	// the interval to poll a Matcher node.
+	interval time.Duration
 }
 
-func NewPoller(interval time.Duration, store Store, differ matcher.Differ) *Poller {
+func NewPoller(store Store, differ matcher.Differ, interval time.Duration) *Poller {
 	return &Poller{
 		interval: interval,
 		store:    store,
@@ -42,38 +39,26 @@ func NewPoller(interval time.Duration, store Store, differ matcher.Differ) *Poll
 	}
 }
 
-// Event is delivered on the poller's channel when
-// a new UpdateOperation is discovered.
+// Event is delivered on the poller's channel when a new UpdateOperation is
+// discovered.
 type Event struct {
 	updater string
 	uo      driver.UpdateOperation
 }
 
-// Poll is a non blocking call which begins
-// polling the Matcher for UpdateOperations.
-//
-// Returned channel can be listened to for events.
+// Poll begins polling the Matcher for UpdateOperations and producing Events on
+// the supplied channel. This method takes ownership of the channel and is
+// responsible for closing it.
 //
 // Cancel ctx to stop the poller.
-func (p *Poller) Poll(ctx context.Context) <-chan Event {
-	c := make(chan Event, MaxChanSize)
-	go p.poll(ctx, c)
-	return c
-}
-
-// poll is intended to be ran as a go routine.
-//
-// implements a blocking event loop via a time.Ticker
-func (p *Poller) poll(ctx context.Context, c chan<- Event) {
-	ctx = baggage.ContextWithValues(ctx,
-		label.String("component", "notifier/Poller.poll"),
-	)
+func (p *Poller) Poll(ctx context.Context, c chan<- Event) error {
+	ctx = zlog.ContextWithValues(ctx, "component", "notifier/Poller.poll")
 
 	defer close(c)
 	if err := ctx.Err(); err != nil {
 		zlog.Info(ctx).
 			Msg("context canceled before polling began")
-		return
+		return err
 	}
 
 	// loop on interval tick
@@ -84,7 +69,7 @@ func (p *Poller) poll(ctx context.Context, c chan<- Event) {
 		case <-ctx.Done():
 			zlog.Info(ctx).
 				Msg("context canceled. polling ended")
-			return
+			return ctx.Err()
 		case <-t.C:
 			zlog.Debug(ctx).
 				Msg("poll interval tick")
@@ -93,12 +78,10 @@ func (p *Poller) poll(ctx context.Context, c chan<- Event) {
 	}
 }
 
-// onTick retrieves the latest update operations for all known
-// updaters and delivers an event if notification creation is necessary.
+// OnTick retrieves the latest update operations for all known updaters and
+// delivers an event if notification creation is necessary.
 func (p *Poller) onTick(ctx context.Context, c chan<- Event) {
-	ctx = baggage.ContextWithValues(ctx,
-		label.String("component", "notifier/Poller.onTick"),
-	)
+	ctx = zlog.ContextWithValues(ctx, "component", "notifier/Poller.onTick")
 
 	latest, err := p.differ.LatestUpdateOperations(ctx, driver.VulnerabilityKind)
 	if err != nil {
@@ -109,16 +92,16 @@ func (p *Poller) onTick(ctx context.Context, c chan<- Event) {
 	}
 
 	for updater, uo := range latest {
-		ctx := baggage.ContextWithValues(ctx, label.String("updater", updater))
+		ctx := zlog.ContextWithValues(ctx, "updater", updater)
 		if len(uo) == 0 {
 			zlog.Debug(ctx).
 				Msg("received 0 update operations after polling Matcher")
 			return // Should this be a continue?
 		}
 		latest := uo[0]
-		ctx = baggage.ContextWithValues(ctx, label.Stringer("UOID", latest.Ref))
+		ctx = zlog.ContextWithValues(ctx, "UOID", latest.Ref.String())
 		// confirm notifications were never created for this UOID.
-		var errNoReceipt clairerror.ErrNoReceipt
+		var errNoReceipt *clairerror.ErrNoReceipt
 		_, err := p.store.ReceiptByUOID(ctx, latest.Ref)
 		if errors.As(err, &errNoReceipt) {
 			e := Event{

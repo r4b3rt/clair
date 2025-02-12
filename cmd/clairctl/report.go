@@ -17,6 +17,7 @@ import (
 	"golang.org/x/sync/errgroup"
 
 	"github.com/quay/clair/v4/internal/codec"
+	"github.com/quay/clair/v4/internal/httputil"
 )
 
 // ReportCmd is the "report" subcommand.
@@ -39,6 +40,17 @@ var ReportCmd = &cli.Command{
 			Usage:       "output format: text, json, xml",
 			DefaultText: "text",
 			Value:       &outFmt{},
+		},
+		&cli.BoolFlag{
+			Name:    "keep-going",
+			Aliases: []string{"k"},
+			Usage:   "when requesting more than one report, don't stop at the first error reported",
+			Value:   false,
+		},
+		&cli.BoolFlag{
+			Name:  "novel",
+			Usage: "only upload novel manifests",
+			Value: false,
 		},
 	},
 }
@@ -100,9 +112,9 @@ type Formatter interface {
 //
 // Users should examine Err first to determine if the request succeeded.
 type Result struct {
-	Name   string
-	Err    error
 	Report *claircore.VulnerabilityReport
+	Err    error
+	Name   string
 }
 
 func reportAction(c *cli.Context) error {
@@ -114,27 +126,34 @@ func reportAction(c *cli.Context) error {
 	// Do we have a config?
 	fi, err := os.Stat(c.Path("config"))
 	useCfg := err == nil && !fi.IsDir()
-
-	var cc *Client
-	if useCfg {
-		cfg, e := loadConfig(c.Path("config"))
-		if e != nil {
-			return e
-		}
-		hc, _, e := cfg.Client(nil, &commonClaim)
-		if e != nil {
-			return e
-		}
-		cc, err = NewClient(hc, c.String("host"))
-	} else {
-		cc, err = NewClient(nil, c.String("host"))
+	ctx := c.Context
+	hc, err := httputil.NewClient(ctx, false)
+	if err != nil {
+		return err
 	}
+
+	var s *httputil.Signer
+	if useCfg {
+		cfg, err := loadConfig(c.Path("config"))
+		if err != nil {
+			return err
+		}
+		s, err = httputil.NewSigner(ctx, cfg, commonClaim)
+		if err != nil {
+			return err
+		}
+		if err = s.Add(ctx, c.String("host")); err != nil {
+			return err
+		}
+	}
+	cc, err := NewClient(hc, c.String("host"), s)
 	if err != nil {
 		return err
 	}
 
 	result := make(chan *Result)
 	done := make(chan struct{})
+	keepgoing := c.Bool("keep-going") && args.Len() > 1
 	eg, ctx := errgroup.WithContext(c.Context)
 	go func() {
 		defer close(done)
@@ -150,21 +169,19 @@ func reportAction(c *cli.Context) error {
 
 	for i := 0; i < args.Len(); i++ {
 		ref := args.Get(i)
+		ctx := zlog.ContextWithValues(ctx, "ref", ref)
 		zlog.Debug(ctx).
-			Str("ref", ref).
 			Msg("fetching")
 		eg.Go(func() error {
-			d, err := resolveRef(ref)
+			d, err := resolveRef(ctx, ref)
 			if err != nil {
 				zlog.Debug(ctx).
-					Str("ref", ref).
 					Err(err).
 					Send()
 				return err
 			}
+			ctx := zlog.ContextWithValues(ctx, "digest", d.String())
 			zlog.Debug(ctx).
-				Str("ref", ref).
-				Stringer("digest", d).
 				Msg("found manifest")
 
 			// This bit is tricky:
@@ -174,25 +191,47 @@ func reportAction(c *cli.Context) error {
 			//
 			// If we need the manifest, populate the manifest and jump to Again.
 			var m *claircore.Manifest
+			ct := 1
 		Again:
+			if ct > 20 {
+				return errors.New("too many attempts")
+			}
+			zlog.Debug(ctx).
+				Int("attempt", ct).
+				Msg("requesting index_report")
 			err = cc.IndexReport(ctx, d, m)
 			switch {
 			case err == nil:
 			case errors.Is(err, errNeedManifest):
+				if c.Bool("novel") {
+					zlog.Debug(ctx).
+						Msg("manifest already known, skipping upload")
+					break
+				}
+				fallthrough
+			case errors.Is(err, errNovelManifest):
 				m, err = Inspect(ctx, ref)
 				if err != nil {
 					zlog.Debug(ctx).
-						Str("ref", ref).
 						Err(err).
 						Msg("manifest error")
+					if keepgoing {
+						zlog.Info(ctx).
+							Err(err).
+							Msg("ignoring manifest error")
+						return nil
+					}
 					return err
 				}
+				ct++
 				goto Again
 			default:
 				zlog.Debug(ctx).
-					Str("ref", ref).
 					Err(err).
 					Msg("index error")
+				if keepgoing {
+					return nil
+				}
 				return err
 			}
 
@@ -200,6 +239,9 @@ func reportAction(c *cli.Context) error {
 				Name: ref,
 			}
 			r.Report, r.Err = cc.VulnerabilityReport(ctx, d)
+			if r.Err != nil {
+				r.Err = fmt.Errorf("%s(%v): %w", ref, d, r.Err)
+			}
 			result <- &r
 			return nil
 		})
@@ -210,12 +252,11 @@ func reportAction(c *cli.Context) error {
 	close(result)
 	<-done
 	return nil
-
 }
 
-func resolveRef(r string) (claircore.Digest, error) {
+func resolveRef(ctx context.Context, r string) (claircore.Digest, error) {
 	var d claircore.Digest
-	rt, err := rt(r)
+	rt, err := rt(ctx, r)
 	if err != nil {
 		return d, err
 	}

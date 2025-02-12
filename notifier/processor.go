@@ -10,8 +10,6 @@ import (
 	"github.com/quay/claircore"
 	"github.com/quay/claircore/libvuln/driver"
 	"github.com/quay/zlog"
-	"go.opentelemetry.io/otel/baggage"
-	"go.opentelemetry.io/otel/label"
 	"golang.org/x/sync/errgroup"
 
 	clairerror "github.com/quay/clair/v4/clair-error"
@@ -25,12 +23,6 @@ import (
 // Processor(s) create atomic boundaries, no two Processor(s) will be creating
 // notifications for the same UOID at once.
 type Processor struct {
-	// NoSummary controls whether per-manifest vulnerability summarization
-	// should happen.
-	NoSummary bool
-	// NoSummary is a little awkward to use, but reversing the boolean this way
-	// makes the defaults line up better.
-
 	// distributed lock used for mutual exclusion
 	locks Locker
 	// a handle to an indexer service
@@ -39,53 +31,40 @@ type Processor struct {
 	matcher matcher.Service
 	// a store instance to persist notifications
 	store Store
-	// a integer id used for logging
-	id int
+
+	// NoSummary controls whether per-manifest vulnerability summarization
+	// should happen.
+	//
+	// The zero value makes the default behavior to do the summary.
+	NoSummary bool
 }
 
-func NewProcessor(id int, l Locker, indexer indexer.Service, matcher matcher.Service, store Store) *Processor {
+func NewProcessor(store Store, l Locker, indexer indexer.Service, matcher matcher.Service) *Processor {
 	return &Processor{
 		locks:   l,
 		indexer: indexer,
 		matcher: matcher,
 		store:   store,
-		id:      id,
 	}
 }
 
-// Process is an async method which receives new UOs as events,
-// creates notifications, persists these notifications,
-// and updates the notifier system with the "latest" seen UOID.
+// Process receives new UOs as events, creates and persists notifications, and
+// updates the notifier system with the "latest" seen UOID.
 //
 // Canceling the ctx will end the processing.
-func (p *Processor) Process(ctx context.Context, c <-chan Event) {
-	go p.process(ctx, c)
-}
+func (p *Processor) Process(ctx context.Context, c <-chan Event) error {
+	ctx = zlog.ContextWithValues(ctx, "component", "notifier/Processor.process")
 
-// process is intended to be ran as a go routine.
-//
-// implements the blocking event loop of a processor.
-func (p *Processor) process(ctx context.Context, c <-chan Event) {
-	ctx = baggage.ContextWithValues(ctx,
-		label.String("component", "notifier/Processor.process"),
-		label.Int("processor_id", p.id),
-	)
-
-	defer func() {
-		if err := p.locks.Close(ctx); err != nil {
-			zlog.Warn(ctx).Err(err).Msg("error closing locker")
-		}
-	}()
 	zlog.Debug(ctx).Msg("processing events")
 	for {
 		select {
 		case <-ctx.Done():
 			zlog.Info(ctx).Msg("context canceled: ending event processing")
-			return
+			return ctx.Err()
 		case e := <-c:
-			ctx := baggage.ContextWithValues(ctx,
-				label.String("updater", e.updater),
-				label.Stringer("UOID", e.uo.Ref),
+			ctx := zlog.ContextWithValues(ctx,
+				"updater", e.updater,
+				"UOID", e.uo.Ref.String(),
 			)
 			zlog.Debug(ctx).Msg("processing")
 			if err := func() error {
@@ -113,9 +92,7 @@ func (p *Processor) process(ctx context.Context, c <-chan Event) {
 //
 // will be performed under a distributed lock
 func (p *Processor) create(ctx context.Context, e Event, prev uuid.UUID) error {
-	ctx = baggage.ContextWithValues(ctx,
-		label.String("component", "notifier/Processor.create"),
-	)
+	ctx = zlog.ContextWithValues(ctx, "component", "notifier/Processor.create")
 	zlog.Debug(ctx).
 		Stringer("prev", prev).
 		Stringer("cur", e.uo.Ref).
@@ -199,8 +176,8 @@ func min(a, b int) int {
 // It has supporting structures for concurrent use and summaries.
 type notifTab struct {
 	sync.Mutex
-	N      []Notification
 	lookup map[string]int // only used in "summary" mode
+	N      []Notification
 }
 
 // GetAffected issues AffectedManifest calls in chunks and merges the result.
@@ -293,12 +270,10 @@ func getAffected(ctx context.Context, ic indexer.Service, nosummary bool, vs []c
 //
 // will be performed under a distributed lock.
 func (p *Processor) safe(ctx context.Context, e Event) (bool, uuid.UUID) {
-	ctx = baggage.ContextWithValues(ctx,
-		label.String("component", "notifier/Processor.safe"),
-	)
+	ctx = zlog.ContextWithValues(ctx, "component", "notifier/Processor.safe")
 
 	// confirm we are not making duplicate notifications
-	var errNoReceipt clairerror.ErrNoReceipt
+	var errNoReceipt *clairerror.ErrNoReceipt
 	_, err := p.store.ReceiptByUOID(ctx, e.uo.Ref)
 	switch {
 	case errors.As(err, &errNoReceipt):

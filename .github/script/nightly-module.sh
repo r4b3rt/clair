@@ -1,15 +1,27 @@
 #!/bin/sh
 set -e
-: ${CLAIRCORE_BRANCH:=main}
-: ${GO_VERSION:=1.17}
-test "${#GO_VERSION}" -gt 4 && GO_VERSION=${GO_VERSION%.*}
-
-cd $(git rev-parse --show-toplevel)
-echo '#' "$(go version)"
-go mod edit "-go=${GO_VERSION}"\
-	"-replace=github.com/quay/claircore=github.com/quay/claircore@${CLAIRCORE_BRANCH}"
-git diff
+: "${CLAIRCORE_BRANCH:=main}"
+cd "$(git rev-parse --show-toplevel)"
 test -d vendor && rm -rf vendor
+
+echo "::group::Edits"
+go mod edit \
+	"-replace=github.com/quay/claircore=github.com/quay/claircore@${CLAIRCORE_BRANCH}"
 go mod tidy
-go mod vendor
-printf '::set-output name=clair_version::%s\n' "$(git describe --tags --always --dirty)"
+go mod download # Shouldn't be needed, but just to be safe...
+echo "::endgroup::"
+
+clair_version="$(git describe --tags --always --dirty --match 'v4.*')"
+echo "clair_version=${clair_version}" >> "$GITHUB_OUTPUT"
+
+cat <<. >>"$GITHUB_STEP_SUMMARY"
+### Changes
+
+- **Go version:** $(go version)
+- **Clair version:** ${clair_version}
+.
+{
+	echo '```patch'
+	git diff
+	echo '```' 
+} >>"$GITHUB_STEP_SUMMARY"

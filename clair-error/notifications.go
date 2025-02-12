@@ -31,7 +31,7 @@ func (e ErrBadNotification) Unwrap() error {
 	return e.E
 }
 
-// ErrDeleteNotification indicates an error while deleting notifcations.
+// ErrDeleteNotification indicates an error while deleting notifications.
 // The wrapped error will contain further details.
 type ErrDeleteNotification struct {
 	NotificationID uuid.UUID
@@ -69,7 +69,7 @@ func (e ErrReceipt) Unwrap() error {
 	return e.E
 }
 
-// ErrCreated indicates an error occured when retrieving created notification ids.
+// ErrCreated indicates an error occurred when retrieving created notification ids.
 type ErrCreated struct {
 	E error
 }
@@ -82,7 +82,7 @@ func (e ErrCreated) Unwrap() error {
 	return e.E
 }
 
-// ErrFailed indicates an error occured when retrieving created notification ids.
+// ErrFailed indicates an error occurred when retrieving created notification ids.
 type ErrFailed struct {
 	E error
 }
@@ -95,7 +95,7 @@ func (e ErrFailed) Unwrap() error {
 	return e.E
 }
 
-// ErrPutNotifications indicates an issues occured when persisting a slice of
+// ErrPutNotifications indicates an issues occurred when persisting a slice of
 // computed notifications.
 // The wrapped error will contain further details.
 type ErrPutNotifications struct {

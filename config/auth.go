@@ -1,6 +1,38 @@
 package config
 
-import "encoding/base64"
+import (
+	"encoding"
+	"encoding/base64"
+	"fmt"
+)
+
+// Base64 is a byte slice that encodes to and from base64-encoded strings.
+type Base64 []byte
+
+var (
+	_ encoding.TextMarshaler   = (Base64)(nil)
+	_ encoding.TextUnmarshaler = (*Base64)(nil)
+)
+
+// MarshalText implements encoding.TextMarshaler.
+func (b Base64) MarshalText() ([]byte, error) {
+	sz := base64.StdEncoding.EncodedLen(len(b))
+	out := make([]byte, sz)
+	base64.StdEncoding.Encode(out, b)
+	return out, nil
+}
+
+// UnmarshalText implements encoding.TextUnmarshaler.
+func (b *Base64) UnmarshalText(in []byte) error {
+	sz := base64.StdEncoding.DecodedLen(len(in))
+	s := make([]byte, sz)
+	n, err := base64.StdEncoding.Decode(s, in)
+	if err != nil {
+		return err
+	}
+	*b = s[:n]
+	return nil
+}
 
 // Auth holds the specific configs for different authentication methods.
 //
@@ -13,8 +45,11 @@ type Auth struct {
 
 // Any reports whether any sort of authentication is configured.
 func (a Auth) Any() bool {
-	return a.PSK != nil ||
-		a.Keyserver != nil
+	return a.PSK != nil
+}
+
+func (a *Auth) lint() ([]Warning, error) {
+	return nil, nil
 }
 
 // AuthKeyserver is the configuration for doing authentication with the Quay
@@ -22,69 +57,40 @@ func (a Auth) Any() bool {
 //
 // The "Intraservice" key is only needed when the overall config mode is not
 // "combo".
+//
+// Deprecated: This authentication method was never used. It was planned for
+// integration with Quay, but ultimately the Quay team decided to remove the
+// keyserver feature altogether.
 type AuthKeyserver struct {
 	API          string `yaml:"api" json:"api"`
-	Intraservice []byte `yaml:"intraservice" json:"intraservice"`
-}
-type keyserverConfig struct {
-	API          string `yaml:"api" json:"api"`
-	Intraservice string `yaml:"intraservice" json:"intraservice"`
+	Intraservice Base64 `yaml:"intraservice" json:"intraservice"`
 }
 
-// UnmarshalYAML implements yaml.Unmarshaler.
-func (a *AuthKeyserver) UnmarshalYAML(f func(interface{}) error) error {
-	var m keyserverConfig
-	if err := f(&m); err != nil {
-		return nil
+func (a *AuthKeyserver) lint() ([]Warning, error) {
+	return nil, &Warning{
+		inner: fmt.Errorf(`authentication method deprecated: %w`, ErrDeprecated),
 	}
-	a.API = m.API
-	s, err := base64.StdEncoding.DecodeString(m.Intraservice)
-	if err != nil {
-		return err
-	}
-	a.Intraservice = s
-	return nil
-}
-
-// MarshalYAML implements yaml.Marshaler.
-func (a *AuthKeyserver) MarshalYAML() (interface{}, error) {
-	return &keyserverConfig{
-		API:          a.API,
-		Intraservice: base64.StdEncoding.EncodeToString(a.Intraservice),
-	}, nil
 }
 
 // AuthPSK is the configuration for doing pre-shared key based authentication.
 //
 // The "Issuer" key is what the service expects to verify as the "issuer" claim.
 type AuthPSK struct {
-	Key    []byte   `yaml:"key" json:"key"`
-	Issuer []string `yaml:"iss" json:"iss"`
-}
-type pskConfig struct {
-	Key    string   `yaml:"key" json:"key"`
+	Key    Base64   `yaml:"key" json:"key"`
 	Issuer []string `yaml:"iss" json:"iss"`
 }
 
-// UnmarshalYAML implements yaml.Unmarshaler.
-func (a *AuthPSK) UnmarshalYAML(f func(interface{}) error) error {
-	var m pskConfig
-	if err := f(&m); err != nil {
-		return nil
+func (a *AuthPSK) validate(_ Mode) ([]Warning, error) {
+	if len(a.Key) == 0 {
+		return nil, &Warning{
+			msg: "key is empty",
+		}
 	}
-	a.Issuer = m.Issuer
-	s, err := base64.StdEncoding.DecodeString(m.Key)
-	if err != nil {
-		return err
+	if len(a.Issuer) == 0 {
+		return nil, &Warning{
+			path: ".iss",
+			msg:  "no issuers defined",
+		}
 	}
-	a.Key = s
-	return nil
-}
-
-// MarshalYAML implements yaml.Marshaler.
-func (a *AuthPSK) MarshalYAML() (interface{}, error) {
-	return &pskConfig{
-		Key:    base64.StdEncoding.EncodeToString(a.Key),
-		Issuer: a.Issuer,
-	}, nil
+	return nil, nil
 }

@@ -12,10 +12,11 @@ import (
 	"net/http/httptest"
 	"testing"
 
-	"gopkg.in/square/go-jose.v2/jwt"
-
-	"github.com/quay/clair/v4/config"
+	"github.com/go-jose/go-jose/v3/jwt"
+	"github.com/quay/clair/config"
 	"github.com/quay/zlog"
+
+	"github.com/quay/clair/v4/internal/httputil"
 )
 
 type authTestcase struct {
@@ -60,6 +61,7 @@ func (tc *authTestcase) Run(ctx context.Context) func(*testing.T) {
 		srv.Start()
 		defer srv.Close()
 
+		tc.Config.Matcher.IndexerAddr = srv.URL
 		// Modify the config, if present
 		if f := tc.ConfigMod; f != nil {
 			f(t, &tc.Config)
@@ -69,16 +71,23 @@ func (tc *authTestcase) Run(ctx context.Context) func(*testing.T) {
 		if tc.Claims == nil {
 			tc.Claims = &defaultClaims
 		}
-
-		// Create a client that has auth according to the config.
-		c, authed, err := tc.Config.Client(nil, tc.Claims)
+		s, err := httputil.NewSigner(ctx, &tc.Config, *tc.Claims)
 		if err != nil {
 			t.Error(err)
 		}
-		t.Logf("authed: %v", authed)
+		req, err := httputil.NewRequestWithContext(ctx, http.MethodGet, srv.URL, nil)
+		if err != nil {
+			t.Error(err)
+		}
+		if err := s.Sign(ctx, req); err != nil {
+			t.Error(err)
+		}
+		if t.Failed() {
+			t.FailNow()
+		}
 
 		// Make the request.
-		res, err := c.Get(srv.URL)
+		res, err := srv.Client().Do(req)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -134,17 +143,6 @@ func TestAuth(t *testing.T) {
 			Claims: &jwt.Claims{Issuer: `geromy`},
 		},
 		{
-			Name: "FakeKeyserver",
-			Config: config.Config{
-				Auth: config.Auth{
-					Keyserver: &config.AuthKeyserver{
-						API:          "http://localhost",
-						Intraservice: fakeKey,
-					},
-				},
-			},
-		},
-		{
 			Name: "PSKBadKey",
 			Config: config.Config{
 				Auth: config.Auth{
@@ -156,19 +154,6 @@ func TestAuth(t *testing.T) {
 			},
 			ShouldFail: true,
 			ConfigMod:  func(_ *testing.T, cfg *config.Config) { cfg.Auth.PSK.Key = []byte("badbeef") },
-		},
-		{
-			Name: "FakeKeyserverFail",
-			Config: config.Config{
-				Auth: config.Auth{
-					Keyserver: &config.AuthKeyserver{
-						API:          "http://localhost",
-						Intraservice: fakeKey,
-					},
-				},
-			},
-			ShouldFail: true,
-			ConfigMod:  func(_ *testing.T, cfg *config.Config) { cfg.Auth.Keyserver = nil },
 		},
 		{
 			Name: "PSKFail",

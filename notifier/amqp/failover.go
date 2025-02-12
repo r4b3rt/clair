@@ -2,13 +2,14 @@ package amqp
 
 import (
 	"context"
+	"crypto/tls"
 	"fmt"
+	"net/url"
 	"sync"
 
+	"github.com/quay/clair/config"
 	"github.com/quay/zlog"
-	samqp "github.com/streadway/amqp"
-	"go.opentelemetry.io/otel/baggage"
-	"go.opentelemetry.io/otel/label"
+	amqp "github.com/rabbitmq/amqp091-go"
 )
 
 // failOver will return the first successful connection made against the provided
@@ -16,20 +17,18 @@ import (
 //
 // failOver is safe for concurrent usage.
 type failOver struct {
-	Config
 	sync.RWMutex
-	conn *samqp.Connection
+	conn     *amqp.Connection
+	tls      *tls.Config
+	exchange *config.Exchange
+	uris     []*url.URL
 }
 
 // Connection returns an AMQP connection to the first broker which successfully
 // handshakes.
-//
-// f's Config field must have it's Validate() method called before this method
-// is used.
-func (f *failOver) Connection(ctx context.Context) (*samqp.Connection, error) {
-	ctx = baggage.ContextWithValues(ctx,
-		label.String("component", "notifier/amqp/failOver.Connection"),
-	)
+func (f *failOver) Connection(ctx context.Context) (*amqp.Connection, error) {
+	ctx = zlog.ContextWithValues(ctx,
+		"component", "notifier/amqp/failOver.Connection")
 
 	f.RLock()
 	if f.conn != nil && !f.conn.IsClosed() {
@@ -40,11 +39,11 @@ func (f *failOver) Connection(ctx context.Context) (*samqp.Connection, error) {
 	}
 	f.RUnlock()
 
-	for _, uri := range f.URIs {
-		ctx := baggage.ContextWithValues(ctx, label.String("broker", uri))
+	for _, uri := range f.uris {
+		ctx := zlog.ContextWithValues(ctx, "broker", uri.String())
 		// safe to always call DialTLS per docs:
 		// 'DialTLS will use the provided tls.Config when it encounters an amqps:// scheme and will dial a plain connection when it encounters an amqp:// scheme.'
-		conn, err := samqp.DialTLS(uri, f.tls)
+		conn, err := amqp.DialTLS(uri.String(), f.tls)
 		if err != nil {
 			if conn != nil {
 				conn.Close()
@@ -64,12 +63,12 @@ func (f *failOver) Connection(ctx context.Context) (*samqp.Connection, error) {
 		}
 		// if the name is "" it's the default exchange which
 		// cannot be declared.
-		if f.Exchange.Name != "" {
+		if f.exchange.Name != "" {
 			err = ch.ExchangeDeclarePassive(
-				f.Exchange.Name,
-				f.Exchange.Type,
-				f.Exchange.Durable,
-				f.Exchange.AutoDelete,
+				f.exchange.Name,
+				f.exchange.Type,
+				f.exchange.Durable,
+				f.exchange.AutoDelete,
 				// these will not be considered in a passive declare
 				false,
 				false,
